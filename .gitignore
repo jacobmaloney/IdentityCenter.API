@@ -1,0 +1,65 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Publish-folder deploy artifact (produced by publish.ps1 / publish.sh)
+publish/
+dist/
+
+# Visual Studio
+.vs/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Rider
+.idea/
+*.sln.iml
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# .NET
+project.lock.json
+project.fragment.lock.json
+artifacts/
+*.binlog
+
+# Secrets / environment-specific config — NEVER commit
+# The committed appsettings.json holds placeholders only; real connection
+# strings live in user-secrets (dev) or env vars / secret store (prod).
+appsettings.Development.json
+appsettings.Production.json
+
+# Local DB files
+*.mdf
+*.ldf
+*.ndf
+*.db
+*.db-shm
+*.db-wal
+
+# Certs / keys
+*.pfx
+*.snk
+
+# OS noise
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Picard scratch-build dirs (compile-only verification leftovers)
+**/bin-verify/
+**/obj-headless/

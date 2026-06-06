@@ -1,0 +1,27 @@
+-- V030: Add missing columns to AccessRequests table
+-- V004 created the table without RequesterName, CreatedAt, UpdatedAt, WorkflowInstanceId
+-- V007 skipped creation because table already existed (IF NOT EXISTS guard)
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'AccessRequests' AND COLUMN_NAME = 'RequesterName')
+BEGIN
+    ALTER TABLE AccessRequests ADD RequesterName NVARCHAR(256) NULL;
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'AccessRequests' AND COLUMN_NAME = 'CreatedAt')
+BEGIN
+    ALTER TABLE AccessRequests ADD CreatedAt DATETIME2 NOT NULL DEFAULT GETUTCDATE();
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'AccessRequests' AND COLUMN_NAME = 'UpdatedAt')
+BEGIN
+    ALTER TABLE AccessRequests ADD UpdatedAt DATETIME2 NOT NULL DEFAULT GETUTCDATE();
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'AccessRequests' AND COLUMN_NAME = 'WorkflowInstanceId')
+BEGIN
+    ALTER TABLE AccessRequests ADD WorkflowInstanceId UNIQUEIDENTIFIER NULL;
+END;
+GO

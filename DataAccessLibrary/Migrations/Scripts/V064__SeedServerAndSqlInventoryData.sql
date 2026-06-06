@@ -1,0 +1,30 @@
+-- V064: Seed Server & SQL Inventory Demo Data  [DISABLED 2026-06-02]
+--
+-- ORIGINAL BEHAVIOR (now removed):
+--   * Created 3 demo "Contoso" DirectoryConnections (On-Prem AD, Azure AD, GCP AD)
+--   * Seeded ~4,000 demo computer Objects across them (~1,000 with SQL Server SPNs)
+--   * Added ObjectAttributes for SPNs, OS info, and SQL metadata
+--     (cpuCores, memoryGB, sqlServerEdition, sqlServerVersion, sqlInstanceName, sqlServerPort)
+--
+-- WHY DISABLED:
+--   A brand-new customer install must come up with an EMPTY Objects table.
+--   Objects should appear ONLY from real directory syncs — never from a migration.
+--   This was the single migration that INSERTed into Objects / ObjectAttributes.
+--
+-- WHY EDIT IN PLACE (instead of a new migration):
+--   The migrator (DatabaseMigrationService) records applied versions + a checksum
+--   but NEVER re-validates the checksum of an already-applied migration. So editing
+--   this script is safe for databases that already ran V064 (e.g. .30) — they will
+--   not re-run it and will not error. The V064 version slot is retained here so the
+--   migration chain (V001..V126+) stays contiguous on fresh installs.
+--
+-- NOTE ON GO BATCHES:
+--   The runner splits scripts on `GO` and executes each batch independently, so a
+--   leading RETURN cannot short-circuit a later batch. This file therefore contains
+--   NO `GO` separators and NO executable seed statements — it is a single no-op batch.
+--
+-- TO RESTORE DEMO DATA (sales/demo environments only):
+--   Recover the original seed body from version control history of this file
+--   (the commit prior to 2026-06-02) and apply it manually against the demo DB.
+
+PRINT 'V064: Demo server/SQL inventory seed is DISABLED — fresh installs start with an empty Objects table.';

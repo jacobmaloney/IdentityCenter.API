@@ -1,0 +1,24 @@
+<Project>
+
+  <!-- Resolve the repo-root Directory.Build.props (the version-stamping one) into
+       a property first, so the Import + its existence guard don't need fragile
+       nested-quote escaping inside a Condition attribute. MSBuild only auto-imports
+       the NEAREST Directory.Build.props walking up from each project, so without
+       this explicit import the root file would be shadowed by this one. -->
+  <PropertyGroup>
+    <_ParentDirBuildProps>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))</_ParentDirBuildProps>
+  </PropertyGroup>
+
+  <Import Project="$(_ParentDirBuildProps)"
+          Condition="'$(_ParentDirBuildProps)' != '' and Exists('$(_ParentDirBuildProps)')" />
+
+  <PropertyGroup>
+    <AccelerateBuildsInVisualStudio>true</AccelerateBuildsInVisualStudio>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+  </PropertyGroup>
+
+</Project>
