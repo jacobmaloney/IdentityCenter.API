@@ -582,20 +582,46 @@ public class ObjectsController : ControllerBase
     private static async Task PersistAttributesAsync(SqlConnection conn, Guid objectId, IReadOnlyDictionary<string, string?> attrs)
     {
         if (attrs.Count == 0) return;
+
+        // Collect every non-typed-column attribute for this object into ONE batch,
+        // de-duped by name (last write wins — same as the old per-row foreach, where
+        // a later key would overwrite an earlier MERGE). The set is then upserted in
+        // a SINGLE round-trip via an OPENJSON-derived source feeding one MERGE, in
+        // place of the old one-ExecuteAsync-per-attribute loop (the dominant N+1:
+        // ~20 round-trips per object collapses to 1). Semantics are preserved exactly:
+        //   WHEN MATCHED     -> UPDATE AttributeValue + LastSyncedAt
+        //   WHEN NOT MATCHED -> INSERT with FirstSyncedAt + LastSyncedAt
+        var batch = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var (key, value) in attrs)
         {
             // Skip keys we already wrote as typed columns.
             if (WritableColumns.Contains(key)) continue;
-            // Upsert into ObjectAttributes.
-            await conn.ExecuteAsync(
-                @"MERGE ObjectAttributes AS tgt
-                  USING (SELECT @ObjectId AS ObjectId, @AttributeName AS AttributeName) AS src
-                     ON tgt.ObjectId = src.ObjectId AND tgt.AttributeName = src.AttributeName
-                  WHEN MATCHED THEN UPDATE SET AttributeValue = @AttributeValue, LastSyncedAt = SYSUTCDATETIME()
-                  WHEN NOT MATCHED THEN INSERT (ObjectId, AttributeName, AttributeValue, FirstSyncedAt, LastSyncedAt)
-                                        VALUES (@ObjectId, @AttributeName, @AttributeValue, SYSUTCDATETIME(), SYSUTCDATETIME());",
-                new { ObjectId = objectId, AttributeName = key, AttributeValue = value });
+            batch[key] = value;
         }
+        if (batch.Count == 0) return;
+
+        // Parameterized end-to-end: the attribute names/values travel as a single
+        // JSON string parameter (@Attrs) — NEVER string-concatenated into the SQL —
+        // and OPENJSON shreds it server-side into the (AttributeName, AttributeValue)
+        // source rows. Injection-safe regardless of attribute contents.
+        var json = JsonSerializer.Serialize(
+            batch.Select(kv => new { AttributeName = kv.Key, AttributeValue = kv.Value }));
+
+        await conn.ExecuteAsync(
+            @"MERGE ObjectAttributes AS tgt
+              USING (
+                  SELECT @ObjectId AS ObjectId, j.AttributeName, j.AttributeValue
+                  FROM OPENJSON(@Attrs)
+                  WITH (
+                      AttributeName  nvarchar(200) '$.AttributeName',
+                      AttributeValue nvarchar(max) '$.AttributeValue'
+                  ) AS j
+              ) AS src
+                 ON tgt.ObjectId = src.ObjectId AND tgt.AttributeName = src.AttributeName
+              WHEN MATCHED THEN UPDATE SET AttributeValue = src.AttributeValue, LastSyncedAt = SYSUTCDATETIME()
+              WHEN NOT MATCHED THEN INSERT (ObjectId, AttributeName, AttributeValue, FirstSyncedAt, LastSyncedAt)
+                                    VALUES (src.ObjectId, src.AttributeName, src.AttributeValue, SYSUTCDATETIME(), SYSUTCDATETIME());",
+            new { ObjectId = objectId, Attrs = json });
     }
 
     private async Task WriteAuditAsync(SqlConnection conn, Guid objectId, string action, BulkUpsertItem item)
