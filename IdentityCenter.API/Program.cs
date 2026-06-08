@@ -12,6 +12,32 @@ using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Run cleanly as a Windows Service when installed via install-service.ps1 (sc.exe / New-Service).
+// This is a NO-OP when launched from the console (dotnet run / .exe in a terminal): the host
+// auto-detects whether it was started by the Windows Service Control Manager, so this single call
+// is safe for dev, console, and service runs alike — no guard needed. It gives the service proper
+// lifetime (clean SCM start/stop, no console window, integrates with auto-restart-on-failure).
+// NOTE: this is an intentional, deployment-only divergence from the IdentityCenter-repo copy of
+// Program.cs — do not mirror it back upstream.
+builder.Host.UseWindowsService();
+
+// ── Listen URL for the PUBLISHED app ─────────────────────────────────────────
+// launchSettings.json (which sets the dev URL) is NOT included in a publish build, so a published
+// app has no port to bind unless we supply one. ASPNETCORE_URLS (the standard env var) takes priority;
+// only when it is absent do we fall back to the "DefaultUrls" key in appsettings.json. This ordering
+// is deliberate: a literal "Urls" key in appsettings is authoritative and CANNOT be overridden by
+// ASPNETCORE_URLS (verified), which would defeat per-machine network binding. By using a custom
+// "DefaultUrls" key applied only as a fallback, ASPNETCORE_URLS=http://0.0.0.0:5062 (set by
+// install-service.ps1 / on the server) always wins.
+if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
+{
+    var defaultUrls = builder.Configuration["DefaultUrls"];
+    if (!string.IsNullOrWhiteSpace(defaultUrls))
+    {
+        builder.WebHost.UseUrls(defaultUrls);
+    }
+}
+
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)

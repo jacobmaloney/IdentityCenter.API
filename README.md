@@ -147,6 +147,97 @@ Either way it binds **http://localhost:5062**. Configure the connection string o
 
 Linux/Mac: `./publish.sh` / `./publish.sh --self-contained [rid]`.
 
+> **Why the published app binds a port at all:** `launchSettings.json` is a **development-only**
+> file and is **not** included in a publish build. The committed `appsettings.json` carries a
+> custom `"DefaultUrls": "http://localhost:5062"` key; `Program.cs` applies it **only when the
+> `ASPNETCORE_URLS` env var is not set** — so the published app binds 5062 out of the box, and
+> `ASPNETCORE_URLS` (e.g. `http://0.0.0.0:5062` for network binding) always overrides it.
+>
+> A note on why it isn't the literal `Urls` key: an appsettings **`Urls`** key is authoritative
+> and **cannot** be overridden by `ASPNETCORE_URLS` (verified empirically). That would defeat
+> per-machine network binding, so we use a custom fallback key instead.
+
+---
+
+## Deploy to a server as a Windows Service (deploy-and-forget)
+
+Run the API as a long-running Windows Service: **auto-start at boot, auto-restart on crash,
+survives reboot, no console window.** `Program.cs` calls `builder.Host.UseWindowsService()`
+(a no-op for console/dev runs, so the same build works everywhere).
+
+**Steps (on the server, elevated PowerShell):**
+
+1. **Publish.** On a dev box (or the server, if it has the SDK):
+   ```powershell
+   .\publish.ps1 -SelfContained     # no .NET install needed on the server (recommended for forget-about-it)
+   # or: .\publish.ps1              # framework-dependent — requires the ASP.NET Core 8 Runtime on the server
+   ```
+
+2. **Copy** the `.\publish` folder (and this repo's `install-service.ps1` / `uninstall-service.ps1`)
+   to the server.
+
+3. **Set the connection string.** Two supported forms — pick one:
+
+   - **Environment-variable form** (the service env block, written for you by `install-service.ps1`,
+     uses this exact `__` mapping):
+     ```
+     ConnectionStrings__DefaultConnection=Data Source=192.168.1.56;Initial Catalog=IdentityCenter15;User ID=sa;Password=...;Trust Server Certificate=True
+     ConnectionStrings__ControlPlane=Data Source=192.168.1.56;Initial Catalog=IdentityCenterControlPlane;User ID=sa;Password=...;Trust Server Certificate=True
+     ```
+     (`__` maps to the `:` nesting — i.e. `ConnectionStrings:DefaultConnection`.) Either pass these to
+     `install-service.ps1` via `-DefaultConnection` / `-ControlPlaneConnection`, or set them once as
+     **machine** env vars and pass `-UseMachineEnvVars`.
+
+   - **`appsettings.Production.json` form** — place it **next to the exe** in the publish folder
+     (this file is **git-ignored**, so it never gets committed):
+     ```json
+     {
+       "ConnectionStrings": {
+         "DefaultConnection": "Data Source=192.168.1.56;Initial Catalog=IdentityCenter15;User ID=sa;Password=...;Trust Server Certificate=True",
+         "ControlPlane": "Data Source=192.168.1.56;Initial Catalog=IdentityCenterControlPlane;User ID=sa;Password=...;Trust Server Certificate=True"
+       }
+     }
+     ```
+
+4. **Install the service:**
+   ```powershell
+   # loopback-only (safe default), connection strings written into the service env block:
+   .\install-service.ps1 -DefaultConnection "..." -ControlPlaneConnection "..."
+
+   # reachable from other machines (e.g. Conduit on another box) — binds 0.0.0.0:5062:
+   .\install-service.ps1 -BindAll -UseMachineEnvVars
+   ```
+   This registers `IdentityCenterApi` with **StartupType=Automatic** and **auto-restart on failure**
+   (`sc.exe failure ... actions= restart/5000`), writes `ASPNETCORE_ENVIRONMENT`, `ASPNETCORE_URLS`,
+   and (optionally) the connection strings into the service's registry environment block, and starts it.
+   Uninstall with `.\uninstall-service.ps1`.
+
+5. **Verify:**
+   ```powershell
+   Get-Service IdentityCenterApi          # Status Running, StartType Automatic
+   Invoke-WebRequest http://localhost:5062/   # the API responds
+   ```
+   `http://<server>:5062/swagger` is **Development-only** by default. In Production the Swagger UI is
+   off (the API surface is not disclosed) unless you set `Swagger:EnableInProduction=true`. Hit the API
+   endpoints directly, or grab `swagger.json` from a dev box.
+
+**Windows-Server hand-steps (not done by the script):**
+
+- **Firewall.** Loopback (`localhost`) needs nothing. If you used `-BindAll` (or set
+  `ASPNETCORE_URLS=http://0.0.0.0:5062`), **open the port** so other machines can reach it:
+  ```powershell
+  New-NetFirewallRule -DisplayName "IdentityCenter API 5062" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5062
+  ```
+- **DataProtection keyring.** Only needed if a connection string is stored encrypted (`enc:` prefix):
+  copy `C:\ProgramData\IdentityCenter\Keys` (app name `IdentityCenter`) to the server. **Plaintext /
+  env-var connection strings need no keyring.**
+- **DB access.** The service runs as **LocalSystem** by default. The lab uses SQL auth (`sa`), so
+  nothing extra is required. If you switch the service to a **domain account** *and* use Windows-auth
+  SQL, grant that account database access.
+
+> **Repo divergence:** the `builder.Host.UseWindowsService()` line in `Program.cs` is a deliberate,
+> deployment-only difference from the IdentityCenter-repo copy. Do **not** mirror it upstream.
+
 ---
 
 ## Drift note (IMPORTANT)
