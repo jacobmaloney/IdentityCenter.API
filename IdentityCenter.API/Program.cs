@@ -255,8 +255,11 @@ if (!app.Environment.IsDevelopment())
 }
 
 // Security response headers. This is a REST/JSON API with no HTML UI, so the CSP is strict:
-// nothing may be loaded or framed. The Swagger UI (dev/opt-in only) is the one HTML surface,
-// so it is exempted from the strict CSP to keep its assets working.
+// nothing may be loaded or framed. Two HTML surfaces are exempted from the strict CSP:
+//   (1) the Swagger UI (dev/opt-in only), which needs its own assets to work; and
+//   (2) the anonymous branded landing page at "/", which renders inline CSS + an inline SVG.
+// The landing page gets a deliberately scoped page-CSP (self + inline styles + data: images);
+// the JSON/API surface keeps the locked-down default-src 'none'.
 app.Use(async (context, next) =>
 {
     var headers = context.Response.Headers;
@@ -264,7 +267,21 @@ app.Use(async (context, next) =>
     headers["X-Content-Type-Options"] = "nosniff";
     headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
     headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()";
-    if (!context.Request.Path.StartsWithSegments("/swagger"))
+
+    var path = context.Request.Path;
+    var isSwagger = path.StartsWithSegments("/swagger");
+    var isLanding = path == "/" || path.StartsWithSegments("/index.html");
+
+    if (isLanding)
+    {
+        // Page-scoped CSP for the branded landing surface only. 'unsafe-inline' for styles is
+        // required because the page ships its CSS inline (no static .css file, and the strict
+        // policy would otherwise block it). It does NOT relax script/connect/object.
+        headers["Content-Security-Policy"] =
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+            "script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+    }
+    else if (!isSwagger)
     {
         headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'";
     }
@@ -288,6 +305,16 @@ app.UseAuthentication();
 app.UseMiddleware<IdentityCenter.API.Middleware.TenantConnectionScopeMiddleware>();
 
 app.UseAuthorization();
+
+// Anonymous branded landing / status page at the root. Explicitly [AllowAnonymous] so it is
+// reachable WITHOUT an API key — the deny-by-default FallbackPolicy would otherwise 401 it.
+// Returns self-contained HTML (inline CSS + inline SVG) with the live version + environment
+// injected; rendered under the page-scoped CSP carved out above. Real API/JSON endpoints are
+// untouched and still require a valid key.
+app.MapGet("/", (IWebHostEnvironment env) =>
+        Results.Content(IdentityCenter.API.LandingPage.Render(env.EnvironmentName), "text/html; charset=utf-8"))
+   .AllowAnonymous()
+   .ExcludeFromDescription();
 
 app.MapControllers();
 
