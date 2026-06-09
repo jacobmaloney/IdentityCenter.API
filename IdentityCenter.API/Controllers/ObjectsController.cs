@@ -1,3 +1,4 @@
+using System.Data;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dapper;
@@ -288,6 +289,27 @@ public class ObjectsController : ControllerBase
             // Most batches share one source; this is just a small cache.
             var sourceToConnection = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
 
+            // ── STAGED SET-BASED REWRITE (2026-06-08) ────────────────────────
+            // The dominant cost in the old path was the per-OBJECT attribute write
+            // (~1 MERGE per object) plus a per-object audit INSERT — i.e. the
+            // 274-row/11.6s batch did thousands of round-trips. We now resolve each
+            // object's row (insert / update / REVIVE) per-row — that logic is delicate
+            // (tombstone revive, ARS 3-state lifecycle) and is preserved EXACTLY — but
+            // we no longer touch ObjectAttributes or ChangeAuditLogs inside that loop.
+            // Instead we accumulate the resolved (ObjectId, attributes) and the audit
+            // rows, then flush BOTH set-based after the loop: ONE SqlBulkCopy + ONE
+            // MERGE for all attributes in the batch, and ONE INSERT for all audit rows.
+            //
+            // The remaining per-row Objects upsert loop is FLAGGED for a follow-up
+            // full SqlBulkCopy + single MERGE-Objects pass (see #61). It was kept
+            // per-row deliberately: $action from a MERGE OUTPUT cannot distinguish
+            // "Updated" from "Revived", and the lifecycle CASE logic branches on the
+            // row's prior DeletedAt/LifecycleState AND the per-item IsActive — folding
+            // that into one MERGE risks corrupting the soft-delete/revive contract,
+            // which is correctness-critical write-back and must not regress.
+            var attrRows = new List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)>();
+            var auditRows = new List<(Guid ObjectId, int OperationType, string NewValue)>();
+
             foreach (var item in request.Items)
             {
                 if (string.IsNullOrWhiteSpace(item.SourceUniqueId)
@@ -353,9 +375,42 @@ public class ObjectsController : ControllerBase
                           ORDER BY CASE WHEN DeletedAt IS NULL THEN 0 ELSE 1 END, CreatedAt ASC",
                         new { connectionId, item.SourceUniqueId });
 
-                    var outcome = existing.HasValue
-                        ? await UpdateObjectAsync(conn, existing.Value.Id, item, wasSoftDeleted: existing.Value.DeletedAt is not null)
-                        : await InsertObjectAsync(conn, connectionId, item);
+                    Guid objectId;
+                    string outcome;
+                    string auditAction;
+                    if (existing.HasValue)
+                    {
+                        objectId = existing.Value.Id;
+                        var wasSoftDeleted = existing.Value.DeletedAt is not null;
+                        await UpdateObjectAsync(conn, objectId, item, wasSoftDeleted);
+                        // A revive is a meaningful state change — audited distinctly so
+                        // a tombstone→reappear round-trip is visible in ChangeAuditLogs.
+                        // The outcome to the sink stays "Updated" either way (a revive is
+                        // an upsert that landed on an existing, if tombstoned, row).
+                        auditAction = wasSoftDeleted ? "Revived" : "Updated";
+                        outcome = "Updated";
+                    }
+                    else
+                    {
+                        objectId = await InsertObjectAsync(conn, connectionId, item);
+                        auditAction = "Created";
+                        outcome = "Created";
+                    }
+
+                    // Stage this object's non-typed attributes + its audit row for the
+                    // batched set-based flush below. Nothing is written to
+                    // ObjectAttributes / ChangeAuditLogs inside this loop anymore.
+                    CollectAttributes(attrRows, objectId, item.Attributes);
+                    auditRows.Add((objectId,
+                        string.Equals(auditAction, "Created", StringComparison.OrdinalIgnoreCase) ? 0 : 1,
+                        JsonSerializer.Serialize(new
+                        {
+                            item.SourceUniqueId,
+                            item.ObjectClass,
+                            item.Source,
+                            action = auditAction,
+                            attributeCount = item.Attributes?.Count ?? 0
+                        })));
 
                     results.Add(new BulkUpsertResult
                     {
@@ -374,6 +429,18 @@ public class ObjectsController : ControllerBase
                     });
                 }
             }
+
+            // ── Set-based attribute flush: ONE SqlBulkCopy + ONE MERGE ───────
+            // Mirrors the proven internal path (SyncObjectRepository.FastBulkUpsert):
+            // stage into #StagingAttrs, then MERGE on (ObjectId, AttributeName).
+            // Matches the REAL ObjectAttributes schema EXACTLY — Id=NEWID() on insert,
+            // (ObjectId, AttributeName, AttributeValue, DataType, LastSyncedAt); there
+            // is NO FirstSyncedAt column (the old code referenced it and omitted Id,
+            // which failed 100% of rows with "Invalid column name 'FirstSyncedAt'").
+            await FlushAttributesAsync(conn, attrRows);
+
+            // ── Set-based audit flush: ONE INSERT for all Created/Updated/Revived rows.
+            await FlushAuditAsync(conn, auditRows);
 
             _logger.LogInformation(
                 "API: bulk upsert batch {BatchId} processed {Total} items ({Created} created, {Updated} updated, {Skipped} skipped, {Failed} failed)",
@@ -413,7 +480,11 @@ public class ObjectsController : ControllerBase
         }
     }
 
-    private async Task<string> InsertObjectAsync(SqlConnection conn, Guid connectionId, BulkUpsertItem item)
+    /// <summary>
+    /// Insert one Objects row and return its new Id. Attributes + audit are NOT
+    /// written here — the caller stages them for the batched set-based flush.
+    /// </summary>
+    private async Task<Guid> InsertObjectAsync(SqlConnection conn, Guid connectionId, BulkUpsertItem item)
     {
         var id = Guid.NewGuid();
         var (columns, parameters) = BuildWritableProjection(item.Attributes);
@@ -467,13 +538,15 @@ public class ObjectsController : ControllerBase
 
         var sql = $"INSERT INTO Objects ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)})";
         await conn.ExecuteAsync(sql, parameters);
-
-        await PersistAttributesAsync(conn, id, item.Attributes);
-        await WriteAuditAsync(conn, id, "Created", item);
-        return "Created";
+        return id;
     }
 
-    private async Task<string> UpdateObjectAsync(SqlConnection conn, Guid existingId, BulkUpsertItem item, bool wasSoftDeleted = false)
+    /// <summary>
+    /// Update (or REVIVE) one Objects row. Lifecycle / tombstone-revive semantics
+    /// are preserved EXACTLY. Attributes + audit are NOT written here — the caller
+    /// stages them for the batched set-based flush.
+    /// </summary>
+    private async Task UpdateObjectAsync(SqlConnection conn, Guid existingId, BulkUpsertItem item, bool wasSoftDeleted = false)
     {
         var (columns, parameters) = BuildWritableProjection(item.Attributes);
 
@@ -539,20 +612,12 @@ public class ObjectsController : ControllerBase
 
         var sql = $"UPDATE Objects SET {string.Join(", ", setClauses)} WHERE Id = @_Id";
         await conn.ExecuteAsync(sql, parameters);
-
-        await PersistAttributesAsync(conn, existingId, item.Attributes);
-        // A revive is a meaningful state change — audit it distinctly so a
-        // tombstone→reappear round-trip is visible in ChangeAuditLogs.
-        await WriteAuditAsync(conn, existingId, wasSoftDeleted ? "Revived" : "Updated", item);
-        // Outcome to the sink stays "Updated" either way — a revive is an upsert
-        // that landed on an existing (if tombstoned) row.
-        return "Updated";
     }
 
     /// <summary>
     /// Splits the inbound attribute payload into (typed-column writes,
     /// SqlParameters). Only whitelisted columns end up in the SQL — the rest
-    /// fall through to <see cref="PersistAttributesAsync"/>.
+    /// fall through to <see cref="CollectAttributes"/> for the batched flush.
     /// </summary>
     private static (List<(string Column, string ParamName)> Columns, DynamicParameters Params)
         BuildWritableProjection(IReadOnlyDictionary<string, string?> attrs)
@@ -579,89 +644,134 @@ public class ObjectsController : ControllerBase
         return (cols, prms);
     }
 
-    private static async Task PersistAttributesAsync(SqlConnection conn, Guid objectId, IReadOnlyDictionary<string, string?> attrs)
+    /// <summary>
+    /// Collect one object's NON-typed-column attributes (the ones that don't map to
+    /// a writable Objects column) into the batch-wide staging list. Pure / no I/O —
+    /// the accumulated rows are flushed set-based in <see cref="FlushAttributesAsync"/>.
+    /// De-duped by name within the object (last write wins, matching the old
+    /// per-object MERGE where a later key overwrote an earlier one).
+    /// </summary>
+    private static void CollectAttributes(
+        List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)> sink,
+        Guid objectId,
+        IReadOnlyDictionary<string, string?> attrs)
     {
         if (attrs.Count == 0) return;
-
-        // Collect every non-typed-column attribute for this object into ONE batch,
-        // de-duped by name (last write wins — same as the old per-row foreach, where
-        // a later key would overwrite an earlier MERGE). The set is then upserted in
-        // a SINGLE round-trip via an OPENJSON-derived source feeding one MERGE, in
-        // place of the old one-ExecuteAsync-per-attribute loop (the dominant N+1:
-        // ~20 round-trips per object collapses to 1). Semantics are preserved exactly:
-        //   WHEN MATCHED     -> UPDATE AttributeValue + LastSyncedAt
-        //   WHEN NOT MATCHED -> INSERT with FirstSyncedAt + LastSyncedAt
-        var batch = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (key, value) in attrs)
         {
             // Skip keys we already wrote as typed columns.
             if (WritableColumns.Contains(key)) continue;
-            batch[key] = value;
+            if (!seen.Add(key)) continue;
+            sink.Add((objectId, key, value, null));
         }
-        if (batch.Count == 0) return;
-
-        // Parameterized end-to-end: the attribute names/values travel as a single
-        // JSON string parameter (@Attrs) — NEVER string-concatenated into the SQL —
-        // and OPENJSON shreds it server-side into the (AttributeName, AttributeValue)
-        // source rows. Injection-safe regardless of attribute contents.
-        var json = JsonSerializer.Serialize(
-            batch.Select(kv => new { AttributeName = kv.Key, AttributeValue = kv.Value }));
-
-        await conn.ExecuteAsync(
-            @"MERGE ObjectAttributes AS tgt
-              USING (
-                  SELECT @ObjectId AS ObjectId, j.AttributeName, j.AttributeValue
-                  FROM OPENJSON(@Attrs)
-                  WITH (
-                      AttributeName  nvarchar(200) '$.AttributeName',
-                      AttributeValue nvarchar(max) '$.AttributeValue'
-                  ) AS j
-              ) AS src
-                 ON tgt.ObjectId = src.ObjectId AND tgt.AttributeName = src.AttributeName
-              WHEN MATCHED THEN UPDATE SET AttributeValue = src.AttributeValue, LastSyncedAt = SYSUTCDATETIME()
-              WHEN NOT MATCHED THEN INSERT (ObjectId, AttributeName, AttributeValue, FirstSyncedAt, LastSyncedAt)
-                                    VALUES (src.ObjectId, src.AttributeName, src.AttributeValue, SYSUTCDATETIME(), SYSUTCDATETIME());",
-            new { ObjectId = objectId, Attrs = json });
     }
 
-    private async Task WriteAuditAsync(SqlConnection conn, Guid objectId, string action, BulkUpsertItem item)
+    /// <summary>
+    /// Flush ALL staged attribute rows for the batch in ONE SqlBulkCopy + ONE MERGE.
+    /// Mirrors the proven internal path (SyncObjectRepository.FastBulkUpsertObjectsAsync):
+    /// bulk-load into a #StagingAttrs temp table, then MERGE on (ObjectId, AttributeName).
+    ///
+    /// Matches the REAL ObjectAttributes schema EXACTLY:
+    ///   (Id uniqueidentifier NOT NULL — NEWID() on insert, NO default),
+    ///   (ObjectId, AttributeName, AttributeValue, DataType, LastSyncedAt).
+    /// There is NO FirstSyncedAt column. The previous code inserted FirstSyncedAt and
+    /// omitted Id, which threw "Invalid column name 'FirstSyncedAt'" and failed 100%
+    /// of rows. SqlBulkCopy + the typed temp table are inherently injection-safe — no
+    /// attribute name/value is ever concatenated into SQL.
+    /// </summary>
+    private async Task FlushAttributesAsync(
+        SqlConnection conn,
+        List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)> attrRows)
     {
+        if (attrRows.Count == 0) return;
+
+        var now = DateTime.UtcNow;
+
+        await conn.ExecuteAsync(@"
+            IF OBJECT_ID('tempdb..#StagingAttrs') IS NOT NULL DROP TABLE #StagingAttrs;
+            CREATE TABLE #StagingAttrs (
+                ObjectId UNIQUEIDENTIFIER NOT NULL,
+                AttributeName NVARCHAR(200) NOT NULL,
+                AttributeValue NVARCHAR(MAX) NULL,
+                DataType NVARCHAR(50) NULL,
+                LastSyncedAt DATETIME2 NOT NULL
+            )");
+
+        using (var table = new DataTable())
+        {
+            table.Columns.Add("ObjectId", typeof(Guid));
+            table.Columns.Add("AttributeName", typeof(string));
+            table.Columns.Add("AttributeValue", typeof(string));
+            table.Columns.Add("DataType", typeof(string));
+            table.Columns.Add("LastSyncedAt", typeof(DateTime));
+            foreach (var (objectId, name, value, dataType) in attrRows)
+            {
+                table.Rows.Add(
+                    objectId,
+                    name,
+                    (object?)value ?? DBNull.Value,
+                    (object?)dataType ?? DBNull.Value,
+                    now);
+            }
+
+            using var bulkCopy = new SqlBulkCopy(conn)
+            {
+                DestinationTableName = "#StagingAttrs",
+                BatchSize = 5000,
+                BulkCopyTimeout = 300
+            };
+            bulkCopy.ColumnMappings.Add("ObjectId", "ObjectId");
+            bulkCopy.ColumnMappings.Add("AttributeName", "AttributeName");
+            bulkCopy.ColumnMappings.Add("AttributeValue", "AttributeValue");
+            bulkCopy.ColumnMappings.Add("DataType", "DataType");
+            bulkCopy.ColumnMappings.Add("LastSyncedAt", "LastSyncedAt");
+            await bulkCopy.WriteToServerAsync(table);
+        }
+
+        await conn.ExecuteAsync(@"
+            MERGE ObjectAttributes AS tgt
+            USING #StagingAttrs AS src
+               ON tgt.ObjectId = src.ObjectId AND tgt.AttributeName = src.AttributeName
+            WHEN MATCHED THEN
+                UPDATE SET AttributeValue = src.AttributeValue, LastSyncedAt = src.LastSyncedAt
+            WHEN NOT MATCHED BY TARGET THEN
+                INSERT (Id, ObjectId, AttributeName, AttributeValue, DataType, LastSyncedAt)
+                VALUES (NEWID(), src.ObjectId, src.AttributeName, src.AttributeValue, src.DataType, src.LastSyncedAt);",
+            commandTimeout: 600);
+
+        await conn.ExecuteAsync("DROP TABLE IF EXISTS #StagingAttrs");
+    }
+
+    /// <summary>
+    /// Flush ALL staged audit rows for the batch in ONE set-based INSERT (Dapper
+    /// expands the row list into a multi-VALUES statement). Best-effort: a failed
+    /// audit write never fails the upsert. Columns match the working EF audit path
+    /// (ChangeAuditLog.FromEntry): Timestamp, UserId, OperationType, EntityType,
+    /// EntityId, Source, NewValue, Success. OperationType: Create=0, Update=1
+    /// (a Revive is recorded as Update with action='Revived' in NewValue).
+    /// </summary>
+    private async Task FlushAuditAsync(SqlConnection conn, List<(Guid ObjectId, int OperationType, string NewValue)> auditRows)
+    {
+        if (auditRows.Count == 0) return;
         try
         {
-            // Map the action verb to the ChangeOperationType enum int that the
-            // ChangeAuditLogs.OperationType column stores. Create=0, Update=1
-            // (see ChangeHistory.Models.ChangeOperationType — int values match the
-            // existing table data). Default to Update for any other verb.
-            var operationType = string.Equals(action, "Created", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
-
-            // Remapped to the REAL ChangeAuditLogs columns. The previous insert
-            // wrote Action/ChangedBy/ChangedAt/ChangeSource/Notes — none of which
-            // exist on this table — and a NEWID() into the bigint identity Id, so
-            // every row was silently dropped by the catch below. Now consistent
-            // with the working EF audit path (ChangeAuditLog.FromEntry): Timestamp,
-            // UserId, OperationType, EntityType, EntityId, Source, NewValue, Success.
+            var rows = auditRows.Select(r => new
+            {
+                EntityId = r.ObjectId,
+                OperationType = r.OperationType,
+                NewValue = r.NewValue
+            });
             await conn.ExecuteAsync(
                 @"INSERT INTO ChangeAuditLogs (Timestamp, UserId, OperationType, EntityType, EntityId, Source, NewValue, Success)
                   VALUES (SYSUTCDATETIME(), 'Conduit', @OperationType, 'Object', @EntityId, 'Conduit-Bulk-API', @NewValue, 1)",
-                new
-                {
-                    EntityId = objectId,
-                    OperationType = operationType,
-                    NewValue = JsonSerializer.Serialize(new
-                    {
-                        item.SourceUniqueId,
-                        item.ObjectClass,
-                        item.Source,
-                        attributeCount = item.Attributes?.Count ?? 0
-                    })
-                });
+                rows);
         }
         catch (Exception ex)
         {
-            // Audit is best-effort — never fail the upsert because the audit row
-            // didn't land. Now that the columns are correct this should not fire;
-            // log at Warning (not Debug) so a future schema divergence is visible.
-            _logger.LogWarning("Audit row write failed for Object {ObjectId} ({Action}): {Error}", objectId, action, ex.Message);
+            // Audit is best-effort — never fail the upsert because the audit rows
+            // didn't land. Log at Warning so a future schema divergence is visible.
+            _logger.LogWarning("Batched audit write failed for {Count} rows (best-effort): {Error}", auditRows.Count, ex.Message);
         }
     }
 
