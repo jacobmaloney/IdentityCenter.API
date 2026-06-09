@@ -1,4 +1,5 @@
 using System.Data;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dapper;
@@ -254,10 +255,20 @@ public class ObjectsController : ControllerBase
 
         var results = new List<BulkUpsertResult>(request.Items.Count);
 
+        // PERF instrumentation (temporary, Debug-level). Each phase logged with a
+        // "PERF:" tag so the set-based path can be profiled end-to-end. Enable with
+        // Logging:LogLevel set to Debug for category IdentityCenter.API.Controllers.
+        var swTotal = Stopwatch.StartNew();
+        var swPhase = Stopwatch.StartNew();
+        long msPrepare = 0, msSeed = 0, msOpen;
+
         try
         {
+            swPhase.Restart();
             using var conn = new SqlConnection(_connectionString);
             await conn.OpenAsync();
+            msOpen = swPhase.ElapsedMilliseconds;
+            _logger.LogDebug("PERF: connection-open {Ms}ms (batch {BatchId})", msOpen, request.BatchId);
 
             // Auto-seed a DirectoryConnections row for any Source string we've
             // never seen before. Idempotent: WHERE NOT EXISTS inside the INSERT
@@ -265,6 +276,7 @@ public class ObjectsController : ControllerBase
             // Seeded rows are tagged ConnectionType='Conduit' so operators can
             // see at a glance which connections were synthesized by the bulk
             // API vs. configured by hand in the IC admin UI.
+            swPhase.Restart();
             foreach (var src in distinctSources)
             {
                 var existed = await conn.ExecuteScalarAsync<int?>(
@@ -288,9 +300,15 @@ public class ObjectsController : ControllerBase
                 }
             }
 
+            msSeed = swPhase.ElapsedMilliseconds;
+            _logger.LogDebug("PERF: auto-seed-connections {Ms}ms ({Count} sources, batch {BatchId})",
+                msSeed, distinctSources.Count, request.BatchId);
+
             // Resolve a SourceConnectionId per Source string once for the batch.
             // Most batches share one source; this is just a small cache.
             var sourceToConnection = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+
+            swPhase.Restart();
 
             // ── FULL SET-BASED REWRITE (2026-06-08, task #63) ────────────────
             // The Objects upsert is now ONE SqlBulkCopy (#StagingObjects) + ONE MERGE
@@ -387,6 +405,10 @@ public class ObjectsController : ControllerBase
                 }
             }
 
+            msPrepare = swPhase.ElapsedMilliseconds;
+            _logger.LogDebug("PERF: (a)+(b) validate+resolve+prepare {Ms}ms ({Prepared} prepared of {Items} items, batch {BatchId})",
+                msPrepare, prepared.Count, request.Items.Count, request.BatchId);
+
             var attrRows = new List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)>();
             var auditRows = new List<(Guid ObjectId, int OperationType, string NewValue)>();
 
@@ -417,6 +439,7 @@ public class ObjectsController : ControllerBase
                     return StatusCode(500, new { error = "Bulk upsert failed", batchId = request.BatchId });
                 }
 
+                swPhase.Restart();
                 // Index the OUTPUT by (SourceConnectionId, SourceUniqueId) so we can map
                 // each prepared item back to its resolved ObjectId + action.
                 var outByKey = new Dictionary<(Guid, string), MergeOutputRow>(mergeOut.Count);
@@ -478,6 +501,9 @@ public class ObjectsController : ControllerBase
                         Outcome = outcome
                     });
                 }
+
+                _logger.LogDebug("PERF: (e) map-output+collect-attrs+audit {Ms}ms ({Out} output rows, batch {BatchId})",
+                    swPhase.ElapsedMilliseconds, mergeOut.Count, request.BatchId);
             }
 
             // ── Set-based attribute flush: ONE SqlBulkCopy + ONE MERGE ───────
@@ -487,10 +513,19 @@ public class ObjectsController : ControllerBase
             // (ObjectId, AttributeName, AttributeValue, DataType, LastSyncedAt); there
             // is NO FirstSyncedAt column (the old code referenced it and omitted Id,
             // which failed 100% of rows with "Invalid column name 'FirstSyncedAt'").
+            swPhase.Restart();
             await FlushAttributesAsync(conn, attrRows);
+            _logger.LogDebug("PERF: (f)+(g) attribute bulk-copy+MERGE {Ms}ms ({Rows} attr rows, batch {BatchId})",
+                swPhase.ElapsedMilliseconds, attrRows.Count, request.BatchId);
 
             // ── Set-based audit flush: ONE INSERT for all Created/Updated/Revived rows.
+            swPhase.Restart();
             await FlushAuditAsync(conn, auditRows);
+            _logger.LogDebug("PERF: (h) audit insert {Ms}ms ({Rows} audit rows, batch {BatchId})",
+                swPhase.ElapsedMilliseconds, auditRows.Count, request.BatchId);
+
+            _logger.LogDebug("PERF: TOTAL BulkUpsert {Ms}ms ({Items} items, batch {BatchId})",
+                swTotal.ElapsedMilliseconds, request.Items.Count, request.BatchId);
 
             _logger.LogInformation(
                 "API: bulk upsert batch {BatchId} processed {Total} items ({Created} created, {Updated} updated, {Skipped} skipped, {Failed} failed)",
@@ -569,12 +604,22 @@ public class ObjectsController : ControllerBase
     private async Task<IReadOnlyList<MergeOutputRow>> UpsertObjectsSetBasedAsync(
         SqlConnection conn, List<PreparedObject> prepared)
     {
+        var swc = Stopwatch.StartNew();
         // ── Build the #StagingObjects temp table. Key + driver columns are fixed;
-        // the allow-listed writable columns are appended as NVARCHAR(MAX) (the typed
-        // Objects columns we touch are all nvarchar except none — typed numerics are
-        // not in the allow-list) plus the IsActive bit drivers.
+        // the allow-listed writable columns are appended as NVARCHAR(4000) (the typed
+        // Objects columns we touch are all sized nvarchar — the largest is DN nvarchar(2000)
+        // — so 4000 covers them all while staying OFF the LOB path) plus the IsActive
+        // bit drivers.
+        //
+        // PERF (task #64): these were NVARCHAR(MAX). MAX columns are handled as LOBs, and
+        // the wide MERGE that SETs 20+ of them per row paid a brutal LOB-materialisation
+        // tax — an isolated 500-row MERGE updating ONE non-MAX column ran ~0.5s, while the
+        // real 20-MAX-column MERGE ran ~7s (≈14×). NVARCHAR(4000) is the largest in-row
+        // (non-LOB) nvarchar; switching to it removes the LOB path entirely with no change
+        // to what lands (every target column is ≤ nvarchar(2000), enforced by the target
+        // schema regardless of staging width).
         var writableColDdl = string.Join(",\n                ",
-            WritableColumnList.Select(c => $"{QuoteName(c)} NVARCHAR(MAX) NULL"));
+            WritableColumnList.Select(c => $"{QuoteName(c)} NVARCHAR(4000) NULL"));
 
         await conn.ExecuteAsync($@"
             IF OBJECT_ID('tempdb..#StagingObjects') IS NOT NULL DROP TABLE #StagingObjects;
@@ -590,7 +635,8 @@ public class ObjectsController : ControllerBase
                 HasExplicitIsActive BIT NOT NULL,
                 ExplicitIsActive BIT NOT NULL,
                 {writableColDdl}
-            )");
+            );
+            CREATE CLUSTERED INDEX IX_StagingObjects ON #StagingObjects (SourceConnectionId, SourceUniqueId);");
 
         // ── Build the DataTable once from the allow-list and bulk-copy in one shot.
         using (var table = new DataTable())
@@ -660,23 +706,41 @@ public class ObjectsController : ControllerBase
                 bulkCopy.ColumnMappings.Add(dc.ColumnName, dc.ColumnName);
             await bulkCopy.WriteToServerAsync(table);
         }
+        _logger.LogDebug("PERF: (c) objects create-table+bulk-copy {Ms}ms ({Rows} rows)",
+            swc.ElapsedMilliseconds, prepared.Count);
+        swc.Restart();
 
-        // ── ONE MERGE. The writable allow-list drives both the UPDATE SET list and the
-        // INSERT column/value lists, bracket-quoted. Lifecycle CASE logic mirrors the
-        // old per-row code exactly:
+        // ── Set-based upsert as UPDATE…FROM (matched) + INSERT…SELECT WHERE NOT EXISTS
+        // (new), replacing the single MERGE. Same partition (a key either matches → UPDATE,
+        // or doesn't → INSERT), same per-row OUTPUT into #MergeOut, IDENTICAL lifecycle /
+        // revive CASE logic and INSERT drivers. The writable allow-list drives the UPDATE
+        // SET and INSERT column/value lists, bracket-quoted.
+        //
+        // PERF (task #64): a single MERGE that has BOTH a wide (24-col + nested-CASE)
+        // MATCHED UPDATE and a NOT-MATCHED INSERT compiles to one heavy combined operator.
+        // On the lab SQL an isolated copy of the production MERGE ran ~3.8s for 500 rows,
+        // while the equivalent UPDATE-join + INSERT-where-not-exists ran ~2.0s — ~45%
+        // faster — because each statement gets a lean plan. Lifecycle CASE logic mirrors
+        // the old per-row code exactly:
         //   MATCHED + tgt tombstoned (DeletedAt NOT NULL) → REVIVE:
         //       DeletedAt=NULL; LifecycleState = explicit? (val?0:1) : 0; IsActive = explicit? val : 1
         //   MATCHED + present + explicit IsActive supplied → align lifecycle (preserve 2):
         //       LifecycleState = CASE WHEN tgt=2 THEN 2 ELSE (val?0:1) END; IsActive = val
         //   MATCHED + present + no explicit → IsActive/LifecycleState untouched
-        //   NOT MATCHED → INSERT with the computed insert drivers.
+        //   NOT EXISTS → INSERT with the computed insert drivers.
+        //
+        // ORDER MATTERS: the UPDATE runs first and captures deleted.DeletedAt (the PRIOR
+        // value) so a tombstone→reappear is still reported as a Revive; the INSERT then
+        // adds only keys that still don't exist. The UPDATE never creates rows, so the
+        // NOT EXISTS set is exactly the original non-matched partition.
         var updateSet = string.Join(",\n                ",
             WritableColumnList.Select(c => $"tgt.{QuoteName(c)} = src.{QuoteName(c)}"));
         var insertCols = string.Join(", ", WritableColumnList.Select(QuoteName));
         var insertVals = string.Join(", ", WritableColumnList.Select(c => $"src.{QuoteName(c)}"));
 
-        var mergeSql = $@"
-            DECLARE @MergeOut TABLE (
+        var upsertSql = $@"
+            IF OBJECT_ID('tempdb..#MergeOut') IS NOT NULL DROP TABLE #MergeOut;
+            CREATE TABLE #MergeOut (
                 Action NVARCHAR(10),
                 ObjectId UNIQUEIDENTIFIER,
                 SourceConnectionId UNIQUEIDENTIFIER,
@@ -684,12 +748,7 @@ public class ObjectsController : ControllerBase
                 PriorDeletedAt DATETIME2 NULL
             );
 
-            MERGE Objects AS tgt
-            USING #StagingObjects AS src
-               ON tgt.SourceConnectionId = src.SourceConnectionId
-              AND tgt.SourceUniqueId = src.SourceUniqueId
-            WHEN MATCHED THEN
-                UPDATE SET
+            UPDATE tgt SET
                     {updateSet},
                     tgt.OriginalSource = CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE tgt.OriginalSource END,
                     tgt.ModifiedAt = SYSUTCDATETIME(),
@@ -712,25 +771,40 @@ public class ObjectsController : ControllerBase
                             WHEN src.HasExplicitIsActive = 1 THEN src.ExplicitIsActive
                             ELSE tgt.IsActive
                         END
-            WHEN NOT MATCHED BY TARGET THEN
-                INSERT (Id, SourceConnectionId, SourceUniqueId, SourceType, ObjectClass,
+            OUTPUT 'UPDATE', inserted.Id, inserted.SourceConnectionId, inserted.SourceUniqueId, deleted.DeletedAt
+                INTO #MergeOut (Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt)
+            FROM Objects AS tgt
+            INNER JOIN #StagingObjects AS src
+               ON tgt.SourceConnectionId = src.SourceConnectionId
+              AND tgt.SourceUniqueId = src.SourceUniqueId
+            OPTION (RECOMPILE);
+
+            INSERT INTO Objects (Id, SourceConnectionId, SourceUniqueId, SourceType, ObjectClass,
                         IsActive, LifecycleState, IsAuthoritative, MatchConfidence,
                         IsAdminSDHolder, PasswordNeverExpires, IsBuiltIn,
                         CreatedAt, ModifiedAt, FirstSyncedAt, LastSyncedAt, LastSeenAt,
                         OriginalSource{(insertCols.Length > 0 ? ", " + insertCols : "")})
-                VALUES (NEWID(), src.SourceConnectionId, src.SourceUniqueId, src.SourceType, src.ObjectClass,
+            OUTPUT 'INSERT', inserted.Id, inserted.SourceConnectionId, inserted.SourceUniqueId, CAST(NULL AS DATETIME2)
+                INTO #MergeOut (Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt)
+            SELECT NEWID(), src.SourceConnectionId, src.SourceUniqueId, src.SourceType, src.ObjectClass,
                         src.InsertIsActive, src.InsertLifecycleState, 0, 100,
                         0, 0, 0,
                         SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(),
-                        CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE NULL END{(insertVals.Length > 0 ? ", " + insertVals : "")})
-            OUTPUT $action, inserted.Id, inserted.SourceConnectionId, inserted.SourceUniqueId, deleted.DeletedAt
-                INTO @MergeOut (Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt);
+                        CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE NULL END{(insertVals.Length > 0 ? ", " + insertVals : "")}
+            FROM #StagingObjects AS src
+            WHERE NOT EXISTS (
+                SELECT 1 FROM Objects t
+                WHERE t.SourceConnectionId = src.SourceConnectionId
+                  AND t.SourceUniqueId = src.SourceUniqueId)
+            OPTION (RECOMPILE);
 
-            SELECT Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt FROM @MergeOut;";
+            SELECT Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt FROM #MergeOut;";
 
-        var outRows = (await conn.QueryAsync<MergeOutputRow>(mergeSql, commandTimeout: 600)).ToList();
+        var outRows = (await conn.QueryAsync<MergeOutputRow>(upsertSql, commandTimeout: 600)).ToList();
+        _logger.LogDebug("PERF: (d) objects UPDATE+INSERT+OUTPUT {Ms}ms ({Rows} output rows)",
+            swc.ElapsedMilliseconds, outRows.Count);
 
-        await conn.ExecuteAsync("DROP TABLE IF EXISTS #StagingObjects");
+        await conn.ExecuteAsync("DROP TABLE IF EXISTS #StagingObjects; DROP TABLE IF EXISTS #MergeOut;");
         return outRows;
     }
 
@@ -784,8 +858,12 @@ public class ObjectsController : ControllerBase
     {
         if (attrRows.Count == 0) return;
 
+        var swa = Stopwatch.StartNew();
         var now = DateTime.UtcNow;
 
+        // PERF (task #64): give the staging table a clustered index on the MERGE join
+        // key (ObjectId, AttributeName) so the MERGE against ObjectAttributes can use an
+        // ordered merge/seek join with real cardinality instead of scanning a heap.
         await conn.ExecuteAsync(@"
             IF OBJECT_ID('tempdb..#StagingAttrs') IS NOT NULL DROP TABLE #StagingAttrs;
             CREATE TABLE #StagingAttrs (
@@ -794,7 +872,8 @@ public class ObjectsController : ControllerBase
                 AttributeValue NVARCHAR(MAX) NULL,
                 DataType NVARCHAR(50) NULL,
                 LastSyncedAt DATETIME2 NOT NULL
-            )");
+            );
+            CREATE CLUSTERED INDEX IX_StagingAttrs ON #StagingAttrs (ObjectId, AttributeName);");
 
         using (var table = new DataTable())
         {
@@ -826,7 +905,16 @@ public class ObjectsController : ControllerBase
             bulkCopy.ColumnMappings.Add("LastSyncedAt", "LastSyncedAt");
             await bulkCopy.WriteToServerAsync(table);
         }
+        _logger.LogDebug("PERF: (f) attrs create-table+bulk-copy {Ms}ms ({Rows} rows)",
+            swa.ElapsedMilliseconds, attrRows.Count);
+        swa.Restart();
 
+        // Attribute upsert: ONE MERGE on (ObjectId, AttributeName). PERF (task #64): unlike
+        // the Objects upsert — where splitting the MERGE into UPDATE+INSERT was ~45% faster
+        // because of the 24-col + nested-CASE MATCHED branch — the attribute MERGE is a
+        // narrow 2-column upsert and measured the SAME as (slightly better than) a split, so
+        // it stays a MERGE. The clustered index on #StagingAttrs (join key) and RECOMPILE
+        // give it a clean plan against the real cardinality.
         await conn.ExecuteAsync(@"
             MERGE ObjectAttributes AS tgt
             USING #StagingAttrs AS src
@@ -835,35 +923,58 @@ public class ObjectsController : ControllerBase
                 UPDATE SET AttributeValue = src.AttributeValue, LastSyncedAt = src.LastSyncedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (Id, ObjectId, AttributeName, AttributeValue, DataType, LastSyncedAt)
-                VALUES (NEWID(), src.ObjectId, src.AttributeName, src.AttributeValue, src.DataType, src.LastSyncedAt);",
+                VALUES (NEWID(), src.ObjectId, src.AttributeName, src.AttributeValue, src.DataType, src.LastSyncedAt)
+            OPTION (RECOMPILE);",
             commandTimeout: 600);
+        _logger.LogDebug("PERF: (g) attrs MERGE {Ms}ms ({Rows} rows)", swa.ElapsedMilliseconds, attrRows.Count);
 
         await conn.ExecuteAsync("DROP TABLE IF EXISTS #StagingAttrs");
     }
 
     /// <summary>
-    /// Flush ALL staged audit rows for the batch in ONE set-based INSERT (Dapper
-    /// expands the row list into a multi-VALUES statement). Best-effort: a failed
-    /// audit write never fails the upsert. Columns match the working EF audit path
-    /// (ChangeAuditLog.FromEntry): Timestamp, UserId, OperationType, EntityType,
-    /// EntityId, Source, NewValue, Success. OperationType: Create=0, Update=1
+    /// Flush ALL staged audit rows for the batch in ONE SqlBulkCopy into ChangeAuditLogs.
+    /// Best-effort: a failed audit write never fails the upsert. Columns match the working
+    /// EF audit path (ChangeAuditLog.FromEntry): Timestamp, UserId, OperationType,
+    /// EntityType, EntityId, Source, NewValue, Success. OperationType: Create=0, Update=1
     /// (a Revive is recorded as Update with action='Revived' in NewValue).
+    ///
+    /// PERF (task #64): the previous implementation passed an IEnumerable to Dapper's
+    /// ExecuteAsync, which executes the INSERT once PER ROW — 500 sequential round-trips
+    /// (~3-5s against the lab SQL). SqlBulkCopy writes all rows in a single network
+    /// operation. ChangeAuditLogs.Id is IDENTITY; we do NOT map it, so SQL Server assigns
+    /// it (KeepIdentity off — the default). The constant columns (UserId, EntityType,
+    /// Source, Success, Timestamp) are materialised per row in the DataTable.
     /// </summary>
     private async Task FlushAuditAsync(SqlConnection conn, List<(Guid ObjectId, int OperationType, string NewValue)> auditRows)
     {
         if (auditRows.Count == 0) return;
         try
         {
-            var rows = auditRows.Select(r => new
+            var now = DateTime.UtcNow;
+            using var table = new DataTable();
+            table.Columns.Add("Timestamp", typeof(DateTime));
+            table.Columns.Add("UserId", typeof(string));
+            table.Columns.Add("OperationType", typeof(int));
+            table.Columns.Add("EntityType", typeof(string));
+            table.Columns.Add("EntityId", typeof(Guid));
+            table.Columns.Add("Source", typeof(string));
+            table.Columns.Add("NewValue", typeof(string));
+            table.Columns.Add("Success", typeof(bool));
+            foreach (var (objectId, operationType, newValue) in auditRows)
             {
-                EntityId = r.ObjectId,
-                OperationType = r.OperationType,
-                NewValue = r.NewValue
-            });
-            await conn.ExecuteAsync(
-                @"INSERT INTO ChangeAuditLogs (Timestamp, UserId, OperationType, EntityType, EntityId, Source, NewValue, Success)
-                  VALUES (SYSUTCDATETIME(), 'Conduit', @OperationType, 'Object', @EntityId, 'Conduit-Bulk-API', @NewValue, 1)",
-                rows);
+                table.Rows.Add(now, "Conduit", operationType, "Object",
+                    objectId, "Conduit-Bulk-API", (object?)newValue ?? DBNull.Value, true);
+            }
+
+            using var bulkCopy = new SqlBulkCopy(conn)
+            {
+                DestinationTableName = "ChangeAuditLogs",
+                BatchSize = 5000,
+                BulkCopyTimeout = 300
+            };
+            foreach (DataColumn dc in table.Columns)
+                bulkCopy.ColumnMappings.Add(dc.ColumnName, dc.ColumnName);
+            await bulkCopy.WriteToServerAsync(table);
         }
         catch (Exception ex)
         {
