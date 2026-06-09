@@ -289,27 +289,34 @@ public class ObjectsController : ControllerBase
             // Most batches share one source; this is just a small cache.
             var sourceToConnection = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
 
-            // ── STAGED SET-BASED REWRITE (2026-06-08) ────────────────────────
-            // The dominant cost in the old path was the per-OBJECT attribute write
-            // (~1 MERGE per object) plus a per-object audit INSERT — i.e. the
-            // 274-row/11.6s batch did thousands of round-trips. We now resolve each
-            // object's row (insert / update / REVIVE) per-row — that logic is delicate
-            // (tombstone revive, ARS 3-state lifecycle) and is preserved EXACTLY — but
-            // we no longer touch ObjectAttributes or ChangeAuditLogs inside that loop.
-            // Instead we accumulate the resolved (ObjectId, attributes) and the audit
-            // rows, then flush BOTH set-based after the loop: ONE SqlBulkCopy + ONE
-            // MERGE for all attributes in the batch, and ONE INSERT for all audit rows.
+            // ── FULL SET-BASED REWRITE (2026-06-08, task #63) ────────────────
+            // The Objects upsert is now ONE SqlBulkCopy (#StagingObjects) + ONE MERGE
+            // with an OUTPUT clause, replacing the old per-row existence-SELECT +
+            // INSERT/UPDATE loop (~23ms/item against the slow .56). Attributes + audit
+            // were already set-based (fb64e0e2/49b6c80); this collapses the last
+            // per-row path. A 500-object batch now does a handful of round-trips total
+            // (bulk-copy objects → MERGE → bulk-copy attrs → MERGE attrs → audit insert)
+            // regardless of batch size.
             //
-            // The remaining per-row Objects upsert loop is FLAGGED for a follow-up
-            // full SqlBulkCopy + single MERGE-Objects pass (see #61). It was kept
-            // per-row deliberately: $action from a MERGE OUTPUT cannot distinguish
-            // "Updated" from "Revived", and the lifecycle CASE logic branches on the
-            // row's prior DeletedAt/LifecycleState AND the per-item IsActive — folding
-            // that into one MERGE risks corrupting the soft-delete/revive contract,
-            // which is correctness-critical write-back and must not regress.
-            var attrRows = new List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)>();
-            var auditRows = new List<(Guid ObjectId, int OperationType, string NewValue)>();
+            // Revive/lifecycle fidelity is preserved EXACTLY via the MERGE OUTPUT:
+            //   $action='INSERT'                       → Created
+            //   $action='UPDATE' AND deleted.DeletedAt → Revived (tombstone reappear)
+            //   $action='UPDATE'                       → Updated
+            // The per-item IsActive→LifecycleState mapping and the revive CASE logic are
+            // computed PER ROW in C# and carried into staging columns, so the MERGE only
+            // copies already-resolved values — no behavior moved from C# into ambiguous
+            // SQL. Allow-listed columns are written via bracket-quoted identifiers built
+            // from the fixed server-side WritableColumns set (never caller input).
 
+            // Stage 1 — resolve each item in-memory (NO per-row Object SQL). Connection
+            // resolution still caches per Source. Invalid / unresolved items short-circuit
+            // to a result here exactly as before; only valid items enter staging.
+            var prepared = new List<PreparedObject>(request.Items.Count);
+            // Index into `prepared` by (connectionId, SourceUniqueId) so a within-batch
+            // duplicate supersedes the earlier staged row in O(1) — the MERGE source must
+            // be unique on the target key or SQL throws "attempted to UPDATE the same row
+            // more than once".
+            var preparedIndex = new Dictionary<(Guid, string), int>(request.Items.Count);
             foreach (var item in request.Items)
             {
                 if (string.IsNullOrWhiteSpace(item.SourceUniqueId)
@@ -325,81 +332,131 @@ public class ObjectsController : ControllerBase
                     continue;
                 }
 
-                try
+                if (!sourceToConnection.TryGetValue(item.Source, out var connectionId))
                 {
-                    if (!sourceToConnection.TryGetValue(item.Source, out var connectionId))
+                    // Match by Name first (auto-seed creates Name = source string).
+                    // Fall back to ConnectionType for backward compat with pre-V126 IC
+                    // instances where an operator may have already hand-created a
+                    // connection of a given type.
+                    connectionId = await conn.ExecuteScalarAsync<Guid?>(
+                        @"SELECT TOP 1 Id FROM DirectoryConnections
+                          WHERE [Name] = @Source AND IsActive = 1
+                          ORDER BY CreatedAt ASC",
+                        new { item.Source }) ?? Guid.Empty;
+                    if (connectionId == Guid.Empty)
                     {
-                        // Match by Name first (auto-seed creates Name = source string).
-                        // Fall back to ConnectionType for backward compat with
-                        // pre-V126 IC instances where an operator may have already
-                        // hand-created a connection of a given type.
                         connectionId = await conn.ExecuteScalarAsync<Guid?>(
                             @"SELECT TOP 1 Id FROM DirectoryConnections
-                              WHERE [Name] = @Source AND IsActive = 1
+                              WHERE ConnectionType = @Source AND IsActive = 1
                               ORDER BY CreatedAt ASC",
                             new { item.Source }) ?? Guid.Empty;
-                        if (connectionId == Guid.Empty)
-                        {
-                            connectionId = await conn.ExecuteScalarAsync<Guid?>(
-                                @"SELECT TOP 1 Id FROM DirectoryConnections
-                                  WHERE ConnectionType = @Source AND IsActive = 1
-                                  ORDER BY CreatedAt ASC",
-                                new { item.Source }) ?? Guid.Empty;
-                        }
-                        sourceToConnection[item.Source] = connectionId;
                     }
+                    sourceToConnection[item.Source] = connectionId;
+                }
 
-                    if (connectionId == Guid.Empty)
+                if (connectionId == Guid.Empty)
+                {
+                    results.Add(new BulkUpsertResult
+                    {
+                        SourceUniqueId = item.SourceUniqueId,
+                        Outcome = "Skipped",
+                        ErrorMessage = $"No active DirectoryConnection of type '{item.Source}'"
+                    });
+                    continue;
+                }
+
+                // De-dup within the batch on (connectionId, SourceUniqueId): the MERGE
+                // source MUST NOT contain two rows for the same target key (SQL throws
+                // "an action of type ... attempted to UPDATE the same row more than
+                // once"). Last write wins, mirroring the old loop where a later item
+                // simply re-UPDATEd the same row. The earlier duplicate is reported as
+                // a redundant Updated outcome (its data was overwritten before landing).
+                var key = (connectionId, item.SourceUniqueId!);
+                if (preparedIndex.TryGetValue(key, out var dupIndex))
+                {
+                    // Supersede the earlier staged row with this later one.
+                    prepared[dupIndex] = new PreparedObject(connectionId, item);
+                }
+                else
+                {
+                    preparedIndex[key] = prepared.Count;
+                    prepared.Add(new PreparedObject(connectionId, item));
+                }
+            }
+
+            var attrRows = new List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)>();
+            var auditRows = new List<(Guid ObjectId, int OperationType, string NewValue)>();
+
+            // Stage 2/3 — SqlBulkCopy + MERGE Objects, then read the OUTPUT back to
+            // derive per-item outcome + the ObjectId for EVERY row (new and existing).
+            if (prepared.Count > 0)
+            {
+                IReadOnlyList<MergeOutputRow> mergeOut;
+                try
+                {
+                    mergeOut = await UpsertObjectsSetBasedAsync(conn, prepared);
+                }
+                catch (Exception mergeEx)
+                {
+                    // A whole-batch MERGE failure is fatal to the object writes — surface
+                    // it the same way the outer catch would, but tag every prepared item
+                    // so the caller sees per-item Failed rather than a silent partial.
+                    _logger.LogError(mergeEx, "API: bulk upsert MERGE failed for batch {BatchId}", request.BatchId);
+                    foreach (var p in prepared)
                     {
                         results.Add(new BulkUpsertResult
                         {
+                            SourceUniqueId = p.Item.SourceUniqueId,
+                            Outcome = "Failed",
+                            ErrorMessage = "Object MERGE failed: " + mergeEx.Message
+                        });
+                    }
+                    return StatusCode(500, new { error = "Bulk upsert failed", batchId = request.BatchId });
+                }
+
+                // Index the OUTPUT by (SourceConnectionId, SourceUniqueId) so we can map
+                // each prepared item back to its resolved ObjectId + action.
+                var outByKey = new Dictionary<(Guid, string), MergeOutputRow>(mergeOut.Count);
+                foreach (var o in mergeOut)
+                    outByKey[(o.SourceConnectionId, o.SourceUniqueId)] = o;
+
+                foreach (var p in prepared)
+                {
+                    var item = p.Item;
+                    if (!outByKey.TryGetValue((p.ConnectionId, item.SourceUniqueId!), out var outRow))
+                    {
+                        // Should never happen — the MERGE emits one OUTPUT row per source
+                        // row. Treat a missing mapping as a failed item rather than a
+                        // mismatched ObjectId.
+                        results.Add(new BulkUpsertResult
+                        {
                             SourceUniqueId = item.SourceUniqueId,
-                            Outcome = "Skipped",
-                            ErrorMessage = $"No active DirectoryConnection of type '{item.Source}'"
+                            Outcome = "Failed",
+                            ErrorMessage = "MERGE did not return an ObjectId for this item"
                         });
                         continue;
                     }
 
-                    // Phase 2.2 Part C reversibility: look up the row REGARDLESS of
-                    // DeletedAt. The unique index IX_Objects_SourceUnique is filtered
-                    // only on SourceUniqueId IS NOT NULL — it spans live AND
-                    // soft-deleted rows. So a tombstoned object that reappears MUST be
-                    // revived (UPDATE, clearing DeletedAt) rather than re-INSERTed,
-                    // which would violate the unique index. We also read DeletedAt so
-                    // we can audit a revive distinctly from a plain update.
-                    var existing = await conn.QueryFirstOrDefaultAsync<(Guid Id, DateTime? DeletedAt)?>(
-                        @"SELECT TOP 1 Id, DeletedAt
-                          FROM Objects
-                          WHERE SourceConnectionId = @connectionId
-                            AND SourceUniqueId = @SourceUniqueId
-                          ORDER BY CASE WHEN DeletedAt IS NULL THEN 0 ELSE 1 END, CreatedAt ASC",
-                        new { connectionId, item.SourceUniqueId });
-
-                    Guid objectId;
-                    string outcome;
-                    string auditAction;
-                    if (existing.HasValue)
+                    var objectId = outRow.ObjectId;
+                    string outcome, auditAction;
+                    if (outRow.IsInsert)
                     {
-                        objectId = existing.Value.Id;
-                        var wasSoftDeleted = existing.Value.DeletedAt is not null;
-                        await UpdateObjectAsync(conn, objectId, item, wasSoftDeleted);
-                        // A revive is a meaningful state change — audited distinctly so
-                        // a tombstone→reappear round-trip is visible in ChangeAuditLogs.
-                        // The outcome to the sink stays "Updated" either way (a revive is
-                        // an upsert that landed on an existing, if tombstoned, row).
-                        auditAction = wasSoftDeleted ? "Revived" : "Updated";
-                        outcome = "Updated";
+                        outcome = "Created";
+                        auditAction = "Created";
                     }
                     else
                     {
-                        objectId = await InsertObjectAsync(conn, connectionId, item);
-                        auditAction = "Created";
-                        outcome = "Created";
+                        // A revive is a meaningful state change — audited distinctly so a
+                        // tombstone→reappear round-trip is visible in ChangeAuditLogs. The
+                        // outcome to the sink stays "Updated" either way (a revive is an
+                        // upsert that landed on an existing, if tombstoned, row).
+                        outcome = "Updated";
+                        auditAction = outRow.PriorDeletedAt is not null ? "Revived" : "Updated";
                     }
 
                     // Stage this object's non-typed attributes + its audit row for the
-                    // batched set-based flush below. Nothing is written to
-                    // ObjectAttributes / ChangeAuditLogs inside this loop anymore.
+                    // batched set-based flush below. ObjectId comes from the MERGE OUTPUT,
+                    // so NEW objects get their attributes too.
                     CollectAttributes(attrRows, objectId, item.Attributes);
                     auditRows.Add((objectId,
                         string.Equals(auditAction, "Created", StringComparison.OrdinalIgnoreCase) ? 0 : 1,
@@ -416,16 +473,6 @@ public class ObjectsController : ControllerBase
                     {
                         SourceUniqueId = item.SourceUniqueId,
                         Outcome = outcome
-                    });
-                }
-                catch (Exception itemEx)
-                {
-                    _logger.LogWarning(itemEx, "Bulk upsert item failed for {SourceUniqueId}", item.SourceUniqueId);
-                    results.Add(new BulkUpsertResult
-                    {
-                        SourceUniqueId = item.SourceUniqueId,
-                        Outcome = "Failed",
-                        ErrorMessage = itemEx.Message
                     });
                 }
             }
@@ -480,169 +527,217 @@ public class ObjectsController : ControllerBase
         }
     }
 
-    /// <summary>
-    /// Insert one Objects row and return its new Id. Attributes + audit are NOT
-    /// written here — the caller stages them for the batched set-based flush.
-    /// </summary>
-    private async Task<Guid> InsertObjectAsync(SqlConnection conn, Guid connectionId, BulkUpsertItem item)
+    /// <summary>One prepared, connection-resolved item awaiting the set-based MERGE.</summary>
+    private readonly record struct PreparedObject(Guid ConnectionId, BulkUpsertItem Item);
+
+    /// <summary>One row from the MERGE OUTPUT clause: maps a source key back to its
+    /// resolved ObjectId, the action taken, and the row's prior DeletedAt (so an
+    /// UPDATE that landed on a tombstone is reported as a Revive).</summary>
+    private readonly record struct MergeOutputRow(
+        string Action, Guid ObjectId, Guid SourceConnectionId, string SourceUniqueId, DateTime? PriorDeletedAt)
     {
-        var id = Guid.NewGuid();
-        var (columns, parameters) = BuildWritableProjection(item.Attributes);
-
-        // Required columns on every insert. Defaults match SyncProjectOrchestrator
-        // behaviour — IsActive=true unless an explicit "IsActive"="false" attribute
-        // is supplied; ModifiedAt + LastSeenAt stamped now.
-        var insertCols = new List<string>
-        {
-            "Id", "SourceConnectionId", "SourceUniqueId", "SourceType", "ObjectClass",
-            "IsActive", "LifecycleState", "IsAuthoritative", "MatchConfidence",
-            "IsAdminSDHolder", "PasswordNeverExpires", "IsBuiltIn",
-            "CreatedAt", "ModifiedAt", "FirstSyncedAt", "LastSyncedAt", "LastSeenAt"
-        };
-        var insertVals = new List<string>
-        {
-            "@_Id", "@_ConnectionId", "@_SourceUniqueId", "@_Source", "@_ObjectClass",
-            "@_IsActive", "@_LifecycleState", "0", "100",
-            "0", "0", "0",
-            "SYSUTCDATETIME()", "SYSUTCDATETIME()", "SYSUTCDATETIME()", "SYSUTCDATETIME()", "SYSUTCDATETIME()"
-        };
-
-        // OriginalSource carries the upstream origin when an intermediary like
-        // Conduit is doing the bulk write. Empty/null leaves the column NULL.
-        if (!string.IsNullOrWhiteSpace(item.OriginalSource))
-        {
-            insertCols.Add("OriginalSource");
-            insertVals.Add("@_OriginalSource");
-            parameters.Add("_OriginalSource", item.OriginalSource);
-        }
-
-        // Mix in any whitelisted typed columns from the attribute payload.
-        foreach (var (col, paramName) in columns)
-        {
-            if (string.Equals(col, "IsActive", StringComparison.OrdinalIgnoreCase)) continue;
-            insertCols.Add(col);
-            insertVals.Add(paramName);
-        }
-
-        parameters.Add("_Id", id);
-        parameters.Add("_ConnectionId", connectionId);
-        parameters.Add("_SourceUniqueId", item.SourceUniqueId);
-        parameters.Add("_Source", item.Source);
-        parameters.Add("_ObjectClass", item.ObjectClass);
-        var insertIsActive = ParseBool(LookupAttr(item.Attributes, "IsActive"), defaultValue: true);
-        parameters.Add("_IsActive", insertIsActive);
-        // ARS 3-state on insert: a brand-new object that arrives present-but-disabled
-        // is Disabled(1); otherwise Active(0). A NOT-MATCHED insert is never a
-        // tombstone, so Deprovisioned(2) is unreachable here.
-        parameters.Add("_LifecycleState", insertIsActive ? 0 : 1);
-
-        var sql = $"INSERT INTO Objects ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)})";
-        await conn.ExecuteAsync(sql, parameters);
-        return id;
+        public bool IsInsert => string.Equals(Action, "INSERT", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>
-    /// Update (or REVIVE) one Objects row. Lifecycle / tombstone-revive semantics
-    /// are preserved EXACTLY. Attributes + audit are NOT written here — the caller
-    /// stages them for the batched set-based flush.
-    /// </summary>
-    private async Task UpdateObjectAsync(SqlConnection conn, Guid existingId, BulkUpsertItem item, bool wasSoftDeleted = false)
-    {
-        var (columns, parameters) = BuildWritableProjection(item.Attributes);
-
-        var setClauses = new List<string>
-        {
-            "ModifiedAt = SYSUTCDATETIME()",
-            "LastSyncedAt = SYSUTCDATETIME()",
-            "LastSeenAt = SYSUTCDATETIME()"
-        };
-
-        // Revive a previously tombstoned row: clear DeletedAt + reactivate +
-        // return the lifecycle to Active (0) so the object is live again "like
-        // nothing happened". This is the reversible half of the tombstone /
-        // deferred-deletion contract: an object that reappears within the
-        // retention window is fully restored, not purged. Only when the row was
-        // soft-deleted AND the caller didn't explicitly send IsActive=false in
-        // this payload (an explicit IsActive flag, if present, is applied via the
-        // writable projection below and wins).
-        var explicitIsActive = LookupAttr(item.Attributes, "IsActive");
-        if (wasSoftDeleted)
-        {
-            setClauses.Add("DeletedAt = NULL");
-            // ARS 3-state: a revive clears Deprovisioned(2) back to Active(0). If the
-            // caller's payload says the reappeared account is disabled (IsActive=false),
-            // it is Disabled(1) -- present but switched off -- NOT Active(0): a
-            // disabled-but-present account exists and must not sit on the purge clock,
-            // but it is also not "normal". So derive the revived state from the
-            // explicit IsActive flag when present, defaulting to Active(0).
-            var reviveDisabled = !string.IsNullOrWhiteSpace(explicitIsActive)
-                                 && !ParseBool(explicitIsActive, defaultValue: true);
-            setClauses.Add(reviveDisabled ? "LifecycleState = 1" : "LifecycleState = 0");
-            if (string.IsNullOrWhiteSpace(explicitIsActive))
-                setClauses.Add("IsActive = 1");
-        }
-        else if (!string.IsNullOrWhiteSpace(explicitIsActive))
-        {
-            // NON-revive update of a present row that carries an explicit IsActive:
-            // keep the lifecycle aligned with the enable/disable bit (ARS 0<->1).
-            // A row currently Deprovisioned(2) is owned by the tombstone/revive
-            // contract -- NEVER reclassify it here; the CASE preserves 2. This is the
-            // out-of-band "account got disabled in source" -> Disabled(1) path, and
-            // the symmetric re-enable -> Active(0).
-            var updIsActive = ParseBool(explicitIsActive, defaultValue: true);
-            setClauses.Add(
-                $"LifecycleState = CASE WHEN LifecycleState = 2 THEN 2 ELSE {(updIsActive ? 0 : 1)} END");
-        }
-        foreach (var (col, paramName) in columns)
-        {
-            setClauses.Add($"{col} = {paramName}");
-        }
-
-        // Refresh OriginalSource on update so a row's upstream origin tracks
-        // the latest known sender. Empty/null skips the SET so a previously
-        // stamped OriginalSource isn't clobbered by a partial sync that
-        // didn't include the field.
-        if (!string.IsNullOrWhiteSpace(item.OriginalSource))
-        {
-            setClauses.Add("OriginalSource = @_OriginalSource");
-            parameters.Add("_OriginalSource", item.OriginalSource);
-        }
-
-        parameters.Add("_Id", existingId);
-
-        var sql = $"UPDATE Objects SET {string.Join(", ", setClauses)} WHERE Id = @_Id";
-        await conn.ExecuteAsync(sql, parameters);
-    }
+    // The Objects allow-list, ordered, as a stable list so the staging DataTable
+    // columns and the MERGE column lists line up 1:1. Excludes IsActive — IsActive is
+    // a typed driver (NOT-NULL bit) handled explicitly, not as a free-text column.
+    private static readonly string[] WritableColumnList =
+        WritableColumns.Where(c => !string.Equals(c, "IsActive", StringComparison.OrdinalIgnoreCase))
+                       .ToArray();
 
     /// <summary>
-    /// Splits the inbound attribute payload into (typed-column writes,
-    /// SqlParameters). Only whitelisted columns end up in the SQL — the rest
-    /// fall through to <see cref="CollectAttributes"/> for the batched flush.
+    /// THE set-based Objects upsert: SqlBulkCopy the whole batch into #StagingObjects,
+    /// then ONE MERGE on (SourceConnectionId, SourceUniqueId) with an OUTPUT clause.
+    /// Replaces the per-row existence-SELECT + INSERT/UPDATE loop. Lifecycle /
+    /// tombstone-revive semantics are preserved EXACTLY — the per-row inputs that the
+    /// old C# branched on (explicit IsActive present?, its value, the insert default)
+    /// are carried into staging columns, and the MERGE reproduces the identical CASE
+    /// logic against tgt.DeletedAt / tgt.LifecycleState.
+    ///
+    /// Allow-listed columns are written via bracket-quoted identifiers taken from the
+    /// fixed server-side <see cref="WritableColumnList"/> — never caller input. Values
+    /// flow only through the typed staging table (SqlBulkCopy), never concatenated into
+    /// SQL, so the dynamic column list is injection-safe.
+    ///
+    /// Returns one <see cref="MergeOutputRow"/> per source row so the caller can derive
+    /// per-item Created/Updated/Revived and resolve the ObjectId for the attribute flush.
     /// </summary>
-    private static (List<(string Column, string ParamName)> Columns, DynamicParameters Params)
-        BuildWritableProjection(IReadOnlyDictionary<string, string?> attrs)
+    private async Task<IReadOnlyList<MergeOutputRow>> UpsertObjectsSetBasedAsync(
+        SqlConnection conn, List<PreparedObject> prepared)
     {
-        var cols = new List<(string, string)>();
-        var prms = new DynamicParameters();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var i = 0;
-        foreach (var (key, value) in attrs)
+        // ── Build the #StagingObjects temp table. Key + driver columns are fixed;
+        // the allow-listed writable columns are appended as NVARCHAR(MAX) (the typed
+        // Objects columns we touch are all nvarchar except none — typed numerics are
+        // not in the allow-list) plus the IsActive bit drivers.
+        var writableColDdl = string.Join(",\n                ",
+            WritableColumnList.Select(c => $"{QuoteName(c)} NVARCHAR(MAX) NULL"));
+
+        await conn.ExecuteAsync($@"
+            IF OBJECT_ID('tempdb..#StagingObjects') IS NOT NULL DROP TABLE #StagingObjects;
+            CREATE TABLE #StagingObjects (
+                SourceConnectionId UNIQUEIDENTIFIER NOT NULL,
+                SourceUniqueId NVARCHAR(450) NOT NULL,
+                SourceType NVARCHAR(200) NOT NULL,
+                ObjectClass NVARCHAR(200) NULL,
+                OriginalSource NVARCHAR(450) NULL,
+                HasOriginalSource BIT NOT NULL,
+                InsertIsActive BIT NOT NULL,
+                InsertLifecycleState INT NOT NULL,
+                HasExplicitIsActive BIT NOT NULL,
+                ExplicitIsActive BIT NOT NULL,
+                {writableColDdl}
+            )");
+
+        // ── Build the DataTable once from the allow-list and bulk-copy in one shot.
+        using (var table = new DataTable())
         {
-            if (!WritableColumns.Contains(key)) continue;
-            if (!seen.Add(key)) continue;
-            var paramName = $"@col{i++}";
-            cols.Add((key, paramName));
-            if (string.Equals(key, "IsActive", StringComparison.OrdinalIgnoreCase))
+            table.Columns.Add("SourceConnectionId", typeof(Guid));
+            table.Columns.Add("SourceUniqueId", typeof(string));
+            table.Columns.Add("SourceType", typeof(string));
+            table.Columns.Add("ObjectClass", typeof(string));
+            table.Columns.Add("OriginalSource", typeof(string));
+            table.Columns.Add("HasOriginalSource", typeof(bool));
+            table.Columns.Add("InsertIsActive", typeof(bool));
+            table.Columns.Add("InsertLifecycleState", typeof(int));
+            table.Columns.Add("HasExplicitIsActive", typeof(bool));
+            table.Columns.Add("ExplicitIsActive", typeof(bool));
+            foreach (var c in WritableColumnList)
+                table.Columns.Add(c, typeof(string));
+
+            foreach (var p in prepared)
             {
-                prms.Add(paramName.TrimStart('@'), ParseBool(value, defaultValue: true));
+                var item = p.Item;
+                var row = table.NewRow();
+                row["SourceConnectionId"] = p.ConnectionId;
+                row["SourceUniqueId"] = item.SourceUniqueId!;
+                row["SourceType"] = item.Source!;
+                row["ObjectClass"] = (object?)item.ObjectClass ?? DBNull.Value;
+
+                var hasOrig = !string.IsNullOrWhiteSpace(item.OriginalSource);
+                row["OriginalSource"] = hasOrig ? item.OriginalSource! : (object)DBNull.Value;
+                row["HasOriginalSource"] = hasOrig;
+
+                // IsActive / lifecycle drivers, computed per-row exactly as the old
+                // InsertObjectAsync / UpdateObjectAsync did.
+                var explicitRaw = LookupAttr(item.Attributes, "IsActive");
+                var hasExplicit = !string.IsNullOrWhiteSpace(explicitRaw);
+                var explicitVal = ParseBool(explicitRaw, defaultValue: true);
+                row["HasExplicitIsActive"] = hasExplicit;
+                row["ExplicitIsActive"] = explicitVal;
+                // Insert default: IsActive=true unless an explicit IsActive=false; a new
+                // present-but-disabled object is Disabled(1), otherwise Active(0).
+                var insertIsActive = hasExplicit ? explicitVal : true;
+                row["InsertIsActive"] = insertIsActive;
+                row["InsertLifecycleState"] = insertIsActive ? 0 : 1;
+
+                // Allow-listed typed columns from the attribute payload (last write wins
+                // per name; only whitelisted keys; IsActive excluded above).
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (key, value) in item.Attributes)
+                {
+                    if (string.Equals(key, "IsActive", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!WritableColumns.Contains(key)) continue;
+                    if (!seen.Add(key)) continue;
+                    // Resolve the canonical allow-list casing for the column name.
+                    var col = WritableColumnList.First(c => string.Equals(c, key, StringComparison.OrdinalIgnoreCase));
+                    row[col] = (object?)value ?? DBNull.Value;
+                }
+
+                table.Rows.Add(row);
             }
-            else
+
+            using var bulkCopy = new SqlBulkCopy(conn)
             {
-                prms.Add(paramName.TrimStart('@'), value);
-            }
+                DestinationTableName = "#StagingObjects",
+                BatchSize = 5000,
+                BulkCopyTimeout = 300
+            };
+            foreach (DataColumn dc in table.Columns)
+                bulkCopy.ColumnMappings.Add(dc.ColumnName, dc.ColumnName);
+            await bulkCopy.WriteToServerAsync(table);
         }
-        return (cols, prms);
+
+        // ── ONE MERGE. The writable allow-list drives both the UPDATE SET list and the
+        // INSERT column/value lists, bracket-quoted. Lifecycle CASE logic mirrors the
+        // old per-row code exactly:
+        //   MATCHED + tgt tombstoned (DeletedAt NOT NULL) → REVIVE:
+        //       DeletedAt=NULL; LifecycleState = explicit? (val?0:1) : 0; IsActive = explicit? val : 1
+        //   MATCHED + present + explicit IsActive supplied → align lifecycle (preserve 2):
+        //       LifecycleState = CASE WHEN tgt=2 THEN 2 ELSE (val?0:1) END; IsActive = val
+        //   MATCHED + present + no explicit → IsActive/LifecycleState untouched
+        //   NOT MATCHED → INSERT with the computed insert drivers.
+        var updateSet = string.Join(",\n                ",
+            WritableColumnList.Select(c => $"tgt.{QuoteName(c)} = src.{QuoteName(c)}"));
+        var insertCols = string.Join(", ", WritableColumnList.Select(QuoteName));
+        var insertVals = string.Join(", ", WritableColumnList.Select(c => $"src.{QuoteName(c)}"));
+
+        var mergeSql = $@"
+            DECLARE @MergeOut TABLE (
+                Action NVARCHAR(10),
+                ObjectId UNIQUEIDENTIFIER,
+                SourceConnectionId UNIQUEIDENTIFIER,
+                SourceUniqueId NVARCHAR(450),
+                PriorDeletedAt DATETIME2 NULL
+            );
+
+            MERGE Objects AS tgt
+            USING #StagingObjects AS src
+               ON tgt.SourceConnectionId = src.SourceConnectionId
+              AND tgt.SourceUniqueId = src.SourceUniqueId
+            WHEN MATCHED THEN
+                UPDATE SET
+                    {updateSet},
+                    tgt.OriginalSource = CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE tgt.OriginalSource END,
+                    tgt.ModifiedAt = SYSUTCDATETIME(),
+                    tgt.LastSyncedAt = SYSUTCDATETIME(),
+                    tgt.LastSeenAt = SYSUTCDATETIME(),
+                    tgt.DeletedAt = CASE WHEN tgt.DeletedAt IS NOT NULL THEN NULL ELSE tgt.DeletedAt END,
+                    tgt.LifecycleState =
+                        CASE
+                            WHEN tgt.DeletedAt IS NOT NULL THEN
+                                CASE WHEN src.HasExplicitIsActive = 1 AND src.ExplicitIsActive = 0 THEN 1 ELSE 0 END
+                            WHEN src.HasExplicitIsActive = 1 THEN
+                                CASE WHEN tgt.LifecycleState = 2 THEN 2
+                                     ELSE CASE WHEN src.ExplicitIsActive = 1 THEN 0 ELSE 1 END END
+                            ELSE tgt.LifecycleState
+                        END,
+                    tgt.IsActive =
+                        CASE
+                            WHEN tgt.DeletedAt IS NOT NULL THEN
+                                CASE WHEN src.HasExplicitIsActive = 1 THEN src.ExplicitIsActive ELSE 1 END
+                            WHEN src.HasExplicitIsActive = 1 THEN src.ExplicitIsActive
+                            ELSE tgt.IsActive
+                        END
+            WHEN NOT MATCHED BY TARGET THEN
+                INSERT (Id, SourceConnectionId, SourceUniqueId, SourceType, ObjectClass,
+                        IsActive, LifecycleState, IsAuthoritative, MatchConfidence,
+                        IsAdminSDHolder, PasswordNeverExpires, IsBuiltIn,
+                        CreatedAt, ModifiedAt, FirstSyncedAt, LastSyncedAt, LastSeenAt,
+                        OriginalSource{(insertCols.Length > 0 ? ", " + insertCols : "")})
+                VALUES (NEWID(), src.SourceConnectionId, src.SourceUniqueId, src.SourceType, src.ObjectClass,
+                        src.InsertIsActive, src.InsertLifecycleState, 0, 100,
+                        0, 0, 0,
+                        SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(),
+                        CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE NULL END{(insertVals.Length > 0 ? ", " + insertVals : "")})
+            OUTPUT $action, inserted.Id, inserted.SourceConnectionId, inserted.SourceUniqueId, deleted.DeletedAt
+                INTO @MergeOut (Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt);
+
+            SELECT Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt FROM @MergeOut;";
+
+        var outRows = (await conn.QueryAsync<MergeOutputRow>(mergeSql, commandTimeout: 600)).ToList();
+
+        await conn.ExecuteAsync("DROP TABLE IF EXISTS #StagingObjects");
+        return outRows;
     }
+
+    /// <summary>
+    /// Bracket-quote a SQL identifier (QUOTENAME equivalent). Identifiers passed here
+    /// come ONLY from the fixed server-side <see cref="WritableColumns"/> allow-list,
+    /// never from caller input; the quoting is defense-in-depth.
+    /// </summary>
+    private static string QuoteName(string identifier)
+        => "[" + identifier.Replace("]", "]]") + "]";
 
     /// <summary>
     /// Collect one object's NON-typed-column attributes (the ones that don't map to
