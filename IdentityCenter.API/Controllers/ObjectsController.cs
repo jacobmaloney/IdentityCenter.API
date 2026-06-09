@@ -53,10 +53,13 @@ public class ObjectsController : ControllerBase
 
     // Strict naming pattern for any caller-supplied Source string that may end
     // up seeded into DirectoryConnections.Name. Alphanumerics + dash + underscore
-    // only; bounded length. Anything else is rejected at request entry — better
-    // to fail loud than to seed garbage connection rows that need manual cleanup.
+    // + dot (DNS domain names like "domain.local2" are valid source names);
+    // bounded length. Anything else is rejected at request entry — better to fail
+    // loud than to seed garbage connection rows that need manual cleanup. NOTE: the
+    // Name is always bound as a @parameter (never concatenated into SQL), so this is
+    // input-hygiene, not the injection guard; '.' is not an injection vector.
     private static readonly Regex SourceNamePattern = new(
-        @"^[A-Za-z0-9_\-]{1,100}$",
+        @"^[A-Za-z0-9_.\-]{1,100}$",
         RegexOptions.Compiled);
 
     // Whitelist of Objects-table columns we accept on a bulk upsert. Keeps the
