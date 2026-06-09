@@ -40,7 +40,7 @@ param(
     [string]$PublishPath = ".\publish",
     [string]$ServiceName = "IdentityCenterApi",
     [string]$DisplayName = "IdentityCenter API",
-    [int]$Port = 5062,
+    [int]$Port = 8080,
     [string]$Environment = "Production",
 
     # URL binding: default loopback-only (safe). -BindAll listens on every interface
