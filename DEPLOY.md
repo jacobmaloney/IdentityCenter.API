@@ -66,6 +66,7 @@ Restart-Service IdentityCenterApi
 - **Keyring**: only needed to decrypt `enc:` connection strings. The plaintext connection strings above
   need no keyring. (If you switch to encrypted strings, the DataProtection keyring at
   `C:\ProgramData\IdentityCenter\Keys`, app name `IdentityCenter`, must be present on the server.)
-- **Logs**: the service currently logs to console (lost when running as a service). For a permanent
-  service, add a Serilog file sink (flagged follow-up) so logs land in a file on the server.
+- **Logs**: the service writes a rolling daily log to **`C:\ProgramData\IdentityCenter\logs\identitycenter-api-<date>.log`**
+  (14-file retention). Override the directory with the `Logging__Directory` env var. This is where to look
+  when the service is running headless.
 - **Re-deploy**: re-run `publish.ps1 -SelfContained`, copy `publish\` over, `Restart-Service IdentityCenterApi`.
