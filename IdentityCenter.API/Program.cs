@@ -38,11 +38,29 @@ if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ASPNETCORE_URL
     }
 }
 
-// Configure Serilog
+// Configure Serilog. A rolling FILE sink is added alongside the console so the app is
+// observable when running as a Windows Service (where console output goes nowhere).
+// Default location is under ProgramData (persists across publish-folder redeploys, same
+// root as the DataProtection keyring); override with the Logging:Directory config key.
+var logDirectory = builder.Configuration["Logging:Directory"];
+if (string.IsNullOrWhiteSpace(logDirectory))
+{
+    logDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "IdentityCenter", "logs");
+}
+try { Directory.CreateDirectory(logDirectory); } catch { /* if unwritable, the file sink no-ops; console still works */ }
+
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .Enrich.FromLogContext()
     .WriteTo.Console()
+    .WriteTo.File(
+        Path.Combine(logDirectory, "identitycenter-api-.log"),
+        rollingInterval: RollingInterval.Day,
+        retainedFileCountLimit: 14,
+        shared: true,
+        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {SourceContext} {Message:lj}{NewLine}{Exception}")
     .CreateLogger();
 
 builder.Host.UseSerilog();
