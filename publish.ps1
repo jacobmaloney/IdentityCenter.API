@@ -27,11 +27,11 @@ Write-Host ("-" * 50) -ForegroundColor Cyan
 if (Test-Path $Output) { Remove-Item $Output -Recurse -Force }
 
 if ($SelfContained) {
-    Write-Host "Mode: SELF-CONTAINED ($Runtime) — runtime included, larger folder." -ForegroundColor Yellow
+    Write-Host "Mode: SELF-CONTAINED ($Runtime) - runtime included, larger folder." -ForegroundColor Yellow
     dotnet publish $ApiProject -c Release -o $Output --self-contained true -r $Runtime
 }
 else {
-    Write-Host "Mode: FRAMEWORK-DEPENDENT — requires ASP.NET Core 8 Runtime on server." -ForegroundColor Yellow
+    Write-Host "Mode: FRAMEWORK-DEPENDENT - requires ASP.NET Core 8 Runtime on server." -ForegroundColor Yellow
     dotnet publish $ApiProject -c Release -o $Output --self-contained false
 }
 

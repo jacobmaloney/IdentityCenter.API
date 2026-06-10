@@ -42,7 +42,7 @@ sc.exe delete $ServiceName | Out-Null
 Start-Sleep -Seconds 1
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-    Write-Host "Service still present — Windows may be finalizing deletion. Re-check with: Get-Service $ServiceName" -ForegroundColor Yellow
+    Write-Host "Service still present - Windows may be finalizing deletion. Re-check with: Get-Service $ServiceName" -ForegroundColor Yellow
 } else {
     Write-Host "Service '$ServiceName' removed." -ForegroundColor Green
 }

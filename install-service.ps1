@@ -104,13 +104,13 @@ Write-Host "  Environment : $Environment"
 $urls = if ($BindAll) { "http://0.0.0.0:$Port" } else { "http://localhost:$Port" }
 Write-Host "  ASPNETCORE_URLS : $urls"
 if ($BindAll) {
-    Write-Host "  (network-bound: remember to open the firewall port $Port — see end of script output)" -ForegroundColor Yellow
+    Write-Host "  (network-bound: remember to open the firewall port $Port - see end of script output)" -ForegroundColor Yellow
 }
 
 # Remove any prior instance so re-running is idempotent.
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  Existing service found — stopping and removing first." -ForegroundColor Yellow
+    Write-Host "  Existing service found - stopping and removing first." -ForegroundColor Yellow
     if ($existing.Status -ne 'Stopped') { Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue }
     sc.exe delete $ServiceName | Out-Null
     Start-Sleep -Seconds 1
@@ -123,7 +123,7 @@ New-Service -Name $ServiceName `
             -Description "IdentityCenter REST API (sync sink + integrations). Auto-start, auto-restart." `
             -StartupType Automatic | Out-Null
 
-# ── Environment block ────────────────────────────────────────────────────────
+# -- Environment block --------------------------------------------------------
 # A Windows service does NOT inherit a user's process env vars, so we write the
 # environment the host needs into the service's own registry Environment value
 # (REG_MULTI_SZ at HKLM\SYSTEM\CurrentControlSet\Services\<name>\Environment).
@@ -154,7 +154,7 @@ elseif (-not $DefaultConnection) {
     Write-Host "        appsettings.Production.json for ConnectionStrings:DefaultConnection." -ForegroundColor Yellow
 }
 
-# ── Auto-restart on failure ──────────────────────────────────────────────────
+# -- Auto-restart on failure --------------------------------------------------
 # reset= 86400 : the failure counter resets after 1 day of healthy uptime.
 # actions= restart/5000 : on each failure, restart after 5000 ms.
 sc.exe failure $ServiceName reset= 86400 actions= restart/5000 | Out-Null
