@@ -1,0 +1,228 @@
+@page "/admin/logs"
+@namespace IdentityCenter.API.AdminUi.Pages
+@attribute [Authorize(Roles = "Admin")]
+@implements IDisposable
+@inject InMemoryLogSink LogSink
+@inject LogFileService LogFiles
+
+<div class="admin-page">
+    <div class="admin-page-header">
+        <h1>Live Logs</h1>
+        <p>Newest entries first. Live view streams the in-memory buffer (last @InMemoryLogSink.Capacity events); switch to a file to read back further.</p>
+    </div>
+
+    <div class="admin-card">
+        <div class="admin-card-header admin-log-toolbar">
+            <div class="admin-log-controls">
+                <button class="@ModeButtonClass(true)" @onclick="() => SetLiveMode(true)">Live</button>
+                <button class="@ModeButtonClass(false)" @onclick="() => SetLiveMode(false)">File</button>
+
+                <select class="admin-select" value="@minLevel" @onchange="OnLevelChanged">
+                    <option value="Verbose">Verbose+</option>
+                    <option value="Debug">Debug+</option>
+                    <option value="Information">Info+</option>
+                    <option value="Warning">Warning+</option>
+                    <option value="Error">Error+</option>
+                </select>
+
+                <input class="admin-search" type="text" placeholder="Filter text…"
+                       value="@searchText" @oninput="OnSearchChanged" />
+
+                @if (liveMode)
+                {
+                    <button class="@FollowButtonClass" @onclick="ToggleFollow">@FollowLabel</button>
+                }
+                else
+                {
+                    <select class="admin-select" value="@selectedFile" @onchange="OnFileChanged">
+                        @foreach (var file in logFileList)
+                        {
+                            <option value="@file.Name">@file.Name (@FormatSize(file.SizeBytes))</option>
+                        }
+                    </select>
+                    <button class="admin-window-btn" @onclick="LoadSelectedFileAsync">Reload</button>
+                }
+            </div>
+            <span class="admin-log-count">@visibleCountLabel</span>
+        </div>
+        <div class="admin-card-body">
+            @if (liveMode)
+            {
+                <div class="admin-log-list admin-log-console">
+                    @foreach (var entry in VisibleLiveEntries)
+                    {
+                        <div class="admin-log-row">
+                            <span class="admin-log-time">@entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss.fff")</span>
+                            <span class="@LevelClass(entry.Level)">@LevelShort(entry.Level)</span>
+                            <span class="admin-log-source">@ShortSource(entry.SourceContext)</span>
+                            <span class="admin-log-message">@entry.Message</span>
+                        </div>
+                        @if (entry.Exception != null)
+                        {
+                            <pre class="admin-log-exception">@entry.Exception</pre>
+                        }
+                    }
+                </div>
+            }
+            else
+            {
+                <div class="admin-log-list admin-log-console">
+                    @foreach (var line in VisibleFileLines)
+                    {
+                        <div class="admin-log-row"><span class="admin-log-message">@line</span></div>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool liveMode = true;
+    private bool follow = true;
+    private string minLevel = "Information";
+    private string searchText = "";
+    private string visibleCountLabel = "";
+
+    private IReadOnlyList<LogFileInfo> logFileList = Array.Empty<LogFileInfo>();
+    private string selectedFile = "";
+    private IReadOnlyList<string> fileLines = Array.Empty<string>();
+
+    private System.Threading.Timer? refreshTimer;
+    private const int MaxVisible = 500;
+
+    private Serilog.Events.LogEventLevel MinLevelValue =>
+        Enum.TryParse<Serilog.Events.LogEventLevel>(minLevel, out var lvl)
+            ? lvl
+            : Serilog.Events.LogEventLevel.Information;
+
+    private List<LogEntry> VisibleLiveEntries
+    {
+        get
+        {
+            var min = MinLevelValue;
+            var query = LogSink.Snapshot().Where(e => e.Level >= min);
+            if (!string.IsNullOrWhiteSpace(searchText))
+            {
+                var needle = searchText.Trim();
+                query = query.Where(e =>
+                    e.Message.Contains(needle, StringComparison.OrdinalIgnoreCase)
+                    || (e.SourceContext?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
+                    || (e.Exception?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false));
+            }
+            var list = query.OrderByDescending(e => e.Id).Take(MaxVisible).ToList();
+            visibleCountLabel = list.Count + " entries";
+            return list;
+        }
+    }
+
+    private List<string> VisibleFileLines
+    {
+        get
+        {
+            IEnumerable<string> query = fileLines;
+            if (!string.IsNullOrWhiteSpace(searchText))
+            {
+                var needle = searchText.Trim();
+                query = query.Where(l => l.Contains(needle, StringComparison.OrdinalIgnoreCase));
+            }
+            var list = query.Reverse().Take(MaxVisible).ToList();
+            visibleCountLabel = list.Count + " lines";
+            return list;
+        }
+    }
+
+    protected override void OnInitialized()
+    {
+        logFileList = LogFiles.ListLogFiles();
+        if (logFileList.Count > 0) selectedFile = logFileList[0].Name;
+        StartFollowTimer();
+    }
+
+    private void StartFollowTimer()
+    {
+        refreshTimer?.Dispose();
+        refreshTimer = new System.Threading.Timer(
+            _ => _ = InvokeAsync(() =>
+            {
+                if (liveMode && follow) StateHasChanged();
+            }),
+            null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    }
+
+    private void SetLiveMode(bool live)
+    {
+        liveMode = live;
+        if (!live && fileLines.Count == 0 && !string.IsNullOrEmpty(selectedFile))
+            _ = LoadSelectedFileAsync();
+    }
+
+    private void ToggleFollow() => follow = !follow;
+
+    private string FollowLabel => follow ? "Following ●" : "Paused ▮▮";
+
+    private string FollowButtonClass => follow ? "admin-window-btn active" : "admin-window-btn";
+
+    private string ModeButtonClass(bool live) =>
+        live == liveMode ? "admin-window-btn active" : "admin-window-btn";
+
+    private void OnLevelChanged(ChangeEventArgs e) => minLevel = e.Value?.ToString() ?? "Information";
+
+    private void OnSearchChanged(ChangeEventArgs e) => searchText = e.Value?.ToString() ?? "";
+
+    private void OnFileChanged(ChangeEventArgs e)
+    {
+        selectedFile = e.Value?.ToString() ?? "";
+        _ = LoadSelectedFileAsync();
+    }
+
+    private async Task LoadSelectedFileAsync()
+    {
+        logFileList = LogFiles.ListLogFiles();
+        if (string.IsNullOrEmpty(selectedFile)) return;
+        // LogFileService validates the NAME and confines resolution to the log directory.
+        var lines = await LogFiles.ReadTailAsync(selectedFile, maxLines: 2000);
+        fileLines = lines ?? Array.Empty<string>();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private static string ShortSource(string? source)
+    {
+        if (string.IsNullOrEmpty(source)) return "";
+        var lastDot = source.LastIndexOf('.');
+        return lastDot >= 0 && lastDot < source.Length - 1 ? source.Substring(lastDot + 1) : source;
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024 * 1024) return (bytes / (1024.0 * 1024.0)).ToString("F1") + " MB";
+        if (bytes >= 1024) return (bytes / 1024.0).ToString("F0") + " KB";
+        return bytes + " B";
+    }
+
+    private static string LevelClass(Serilog.Events.LogEventLevel level) => level switch
+    {
+        Serilog.Events.LogEventLevel.Fatal => "admin-log-level fatal",
+        Serilog.Events.LogEventLevel.Error => "admin-log-level error",
+        Serilog.Events.LogEventLevel.Warning => "admin-log-level warning",
+        Serilog.Events.LogEventLevel.Debug => "admin-log-level debug",
+        Serilog.Events.LogEventLevel.Verbose => "admin-log-level debug",
+        _ => "admin-log-level"
+    };
+
+    private static string LevelShort(Serilog.Events.LogEventLevel level) => level switch
+    {
+        Serilog.Events.LogEventLevel.Verbose => "VRB",
+        Serilog.Events.LogEventLevel.Debug => "DBG",
+        Serilog.Events.LogEventLevel.Information => "INF",
+        Serilog.Events.LogEventLevel.Warning => "WRN",
+        Serilog.Events.LogEventLevel.Error => "ERR",
+        Serilog.Events.LogEventLevel.Fatal => "FTL",
+        _ => "???"
+    };
+
+    public void Dispose()
+    {
+        refreshTimer?.Dispose();
+    }
+}

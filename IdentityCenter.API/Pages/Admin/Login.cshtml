@@ -1,0 +1,94 @@
+@page "/admin/login"
+@model IdentityCenter.API.Pages.Admin.LoginModel
+@{
+    ViewData["Title"] = "Log in";
+    Layout = null;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] - @Model.ProductName</title>
+    @* Same stylesheet stack as the IdentityCenter WebPortal login (files copied verbatim from
+       WebPortal/wwwroot/css) so the two sign-in experiences are visually identical.
+       Divergences from the WebPortal page, both deliberate:
+         - no localStorage theme inline script (admin CSP disallows inline script; dark theme is the default);
+         - no FontAwesome CDN (this box may be offline; the shield icon below is an inline SVG instead). *@
+    <link rel="stylesheet" href="~/css/bootstrap/bootstrap.min.css" />
+    <link rel="stylesheet" href="~/css/design-tokens.css" />
+    <link rel="stylesheet" href="~/css/dark-theme.css" />
+    <link rel="stylesheet" href="~/css/components.css" />
+</head>
+<body>
+
+<div class="login-page">
+    <div class="login-card">
+        <div class="login-header">
+            <div class="login-icon" style="@(Model.LogoDataUri != null ? "background:none; width:auto; height:auto;" : "")">
+                @if (Model.LogoDataUri != null)
+                {
+                    <img src="@Model.LogoDataUri" alt="@Model.ProductName"
+                         style="max-height:64px; max-width:200px; object-fit:contain;" />
+                }
+                else
+                {
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="34" height="34"
+                         fill="none" stroke="var(--color-primary)" stroke-width="1.8"
+                         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z" />
+                        <path d="M9 12l2 2 4-4" />
+                    </svg>
+                }
+            </div>
+            <h2>@Model.ProductName</h2>
+            <p>API Administration — sign in to your account</p>
+        </div>
+
+        @*
+          ── External identity provider extension point ─────────────────────────────────
+          When Jacob wires the shared IDP configuration in (the WebPortal's IdentityProviders
+          table lives in the same database), the provider buttons mount HERE — same structure
+          as WebPortal/Areas/Identity/Pages/Account/Login.cshtml:
+
+            @@foreach (var provider in Model.ExternalProviders) { … "Sign in with …" button … }
+            <div class="login-divider"><span>Or sign in with your local account</span></div>
+
+          The .login-external-btn and .login-divider styles are already present in the copied
+          components.css, so no CSS work is needed when that lands. Nothing reads the provider
+          table today — local credentials only, by design.
+        *@
+
+        <form id="account" method="post" class="login-form">
+            <div asp-validation-summary="ModelOnly" class="text-danger"></div>
+
+            <div class="form-floating">
+                <input asp-for="Input.Email" class="form-control" autocomplete="username" aria-required="true" placeholder="name@example.com" />
+                <label asp-for="Input.Email">Email</label>
+                <span asp-validation-for="Input.Email" class="text-danger"></span>
+            </div>
+
+            <div class="form-floating">
+                <input asp-for="Input.Password" type="password" class="form-control" autocomplete="current-password" aria-required="true" placeholder="password" />
+                <label asp-for="Input.Password">Password</label>
+                <span asp-validation-for="Input.Password" class="text-danger"></span>
+            </div>
+
+            <div class="form-check mb-3">
+                <input class="form-check-input" asp-for="Input.RememberMe" />
+                <label class="form-check-label" asp-for="Input.RememberMe">Remember me?</label>
+            </div>
+
+            <button id="login-submit" type="submit" class="login-btn">Sign In</button>
+        </form>
+
+        <div class="login-footer">
+            <p style="color: var(--color-text-secondary); font-size: 0.9em;">
+                Uses your IdentityCenter portal credentials.
+            </p>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>

@@ -43,8 +43,16 @@ public sealed class TenantDataAuthorizationHandler : AuthorizationHandler<Tenant
             return Task.CompletedTask;
         }
 
-        // Legacy single-tenant key (any other authenticated key_type) → allowed for back-compat;
-        // it runs against DefaultConnection because no tenant context was set.
+        // Legacy AGENT key → explicitly NOT allowed on tenant data. Agent keys exist for the
+        // agent surface only (Jobs, Inventory, Discovery — AgentPolicy endpoints); they have no
+        // business reading Objects/Identities/Compliance. Conduit pushes with a legacy ADMIN key
+        // (KeyType=Admin, scope=admin — verified against the live ApiKeys store 2026-06-09), so
+        // this denial does not affect ingest. (2026-06-09 security-review fix.)
+        if (string.Equals(keyType, "Agent", StringComparison.OrdinalIgnoreCase))
+            return Task.CompletedTask; // do not Succeed → 403
+
+        // Legacy single-tenant key (any other authenticated key_type, e.g. Admin/User) → allowed
+        // for back-compat; it runs against DefaultConnection because no tenant context was set.
         context.Succeed(requirement);
         return Task.CompletedTask;
     }

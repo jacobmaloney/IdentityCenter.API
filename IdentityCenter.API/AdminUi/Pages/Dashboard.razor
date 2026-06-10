@@ -1,0 +1,264 @@
+@page "/admin"
+@namespace IdentityCenter.API.AdminUi.Pages
+@attribute [Authorize(Roles = "Admin")]
+@implements IDisposable
+@inject RequestMetricsStore Metrics
+@inject InMemoryLogSink LogSink
+
+<div class="admin-page">
+    <div class="admin-page-header">
+        <h1>Dashboard</h1>
+        <p>Live API traffic and health. Updates every 2 seconds — in-memory telemetry since service start.</p>
+    </div>
+
+    <div class="admin-stat-row">
+        <div class="admin-stat-card">
+            <div class="admin-stat-value">@summary.Count.ToString("N0")</div>
+            <div class="admin-stat-label">Requests (last hour)</div>
+        </div>
+        <div class="admin-stat-card">
+            <div class="admin-stat-value">@summary.HostCount</div>
+            <div class="admin-stat-label">Active hosts</div>
+        </div>
+        <div class="admin-stat-card">
+            <div class="admin-stat-value @WarnClass(summary.Errors)">@summary.Errors.ToString("N0")</div>
+            <div class="admin-stat-label">4xx (last hour)</div>
+        </div>
+        <div class="admin-stat-card">
+            <div class="admin-stat-value @DangerClass(summary.Failures)">@summary.Failures.ToString("N0")</div>
+            <div class="admin-stat-label">5xx (last hour)</div>
+        </div>
+        <div class="admin-stat-card">
+            <div class="admin-stat-value">@summary.AvgDurationMs<span class="admin-stat-unit">ms</span></div>
+            <div class="admin-stat-label">Avg latency (last hour)</div>
+        </div>
+    </div>
+
+    <div class="admin-card">
+        <div class="admin-card-header">
+            <h2>Requests per host</h2>
+            <div class="admin-window-picker">
+                <button class="@WindowButtonClass(5)" @onclick="() => SetWindow(5)">5 min</button>
+                <button class="@WindowButtonClass(15)" @onclick="() => SetWindow(15)">15 min</button>
+                <button class="@WindowButtonClass(30)" @onclick="() => SetWindow(30)">30 min</button>
+            </div>
+        </div>
+        <div class="admin-card-body">
+            @if (chartSeries.Count == 0)
+            {
+                <div class="admin-chart-empty">No API traffic in the selected window yet. Hit any /api endpoint and watch this move.</div>
+            }
+            else
+            {
+                <svg class="admin-chart" viewBox="0 0 860 300" preserveAspectRatio="none" role="img" aria-label="Requests per host over time">
+                    @foreach (var tick in yTicks)
+                    {
+                        <line x1="@PlotLeft" y1="@tick.Y" x2="@PlotRight" y2="@tick.Y" class="admin-chart-grid" />
+                        @* SVG <text> collides with Razor's literal <text> tag, so axis labels are
+                           emitted as a MarkupString. Content is exclusively self-generated numbers/
+                           times and is HTML-encoded inside SvgText regardless. *@
+                        @SvgText(PlotLeft - 8, tick.Y + 4, "end", tick.Label)
+                    }
+                    <line x1="@PlotLeft" y1="@PlotBottom" x2="@PlotRight" y2="@PlotBottom" class="admin-chart-axisline" />
+                    @foreach (var line in chartLines)
+                    {
+                        <polyline points="@line.Points" fill="none" stroke="@line.Color" stroke-width="2" />
+                    }
+                    @SvgText(PlotLeft, PlotBottom + 22, "start", xStartLabel)
+                    @SvgText(PlotRight, PlotBottom + 22, "end", xEndLabel)
+                </svg>
+                <div class="admin-chart-legend">
+                    @foreach (var line in chartLines)
+                    {
+                        <span class="admin-legend-item">
+                            <span class="admin-legend-swatch" style="@SwatchStyle(line.Color)"></span>
+                            @line.Host <span class="admin-legend-total">(@line.Total.ToString("N0"))</span>
+                        </span>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+
+    <div class="admin-card">
+        <div class="admin-card-header">
+            <h2>Recent warnings &amp; errors</h2>
+            <a href="/admin/logs" class="admin-card-link">Open live logs →</a>
+        </div>
+        <div class="admin-card-body">
+            @if (recentProblems.Count == 0)
+            {
+                <div class="admin-chart-empty">Nothing logged at Warning or above recently. Good.</div>
+            }
+            else
+            {
+                <div class="admin-log-list">
+                    @foreach (var entry in recentProblems)
+                    {
+                        <div class="admin-log-row">
+                            <span class="admin-log-time">@entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss")</span>
+                            <span class="@LevelClass(entry.Level)">@LevelShort(entry.Level)</span>
+                            <span class="admin-log-message">@entry.Message</span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private const double PlotLeft = 56;
+    private const double PlotRight = 850;
+    private const double PlotTop = 14;
+    private const double PlotBottom = 262;
+
+    private static readonly string[] Palette =
+    {
+        "#00bcd4", "#a78bfa", "#4ade80", "#fbbf24", "#f87171",
+        "#38bdf8", "#fb923c", "#e879f9", "#94a3b8", "#2dd4bf"
+    };
+
+    private sealed record ChartLine(string Host, string Color, string Points, long Total);
+    private sealed record YTick(double Y, string Label);
+
+    private int windowMinutes = 5;
+    private MetricsSummary summary = new(0, 0, 0, 0, 0);
+    private IReadOnlyList<HostSeries> chartSeries = Array.Empty<HostSeries>();
+    private List<ChartLine> chartLines = new();
+    private List<YTick> yTicks = new();
+    private string xStartLabel = "";
+    private string xEndLabel = "";
+    private List<LogEntry> recentProblems = new();
+    private System.Threading.Timer? refreshTimer;
+
+    protected override void OnInitialized()
+    {
+        RecomputeModel();
+        refreshTimer = new System.Threading.Timer(
+            _ => _ = InvokeAsync(() => { RecomputeModel(); StateHasChanged(); }),
+            null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    private void SetWindow(int minutes)
+    {
+        windowMinutes = minutes;
+        RecomputeModel();
+    }
+
+    private void RecomputeModel()
+    {
+        summary = Metrics.GetSummary(TimeSpan.FromHours(1));
+        chartSeries = Metrics.GetSeries(TimeSpan.FromMinutes(windowMinutes));
+
+        // Scale: shared max across all hosts so the lines compare honestly.
+        long maxY = 1;
+        foreach (var s in chartSeries)
+            foreach (var p in s.Points)
+                if (p.Count > maxY) maxY = p.Count;
+
+        chartLines = new List<ChartLine>();
+        var colorIndex = 0;
+        foreach (var s in chartSeries.Take(Palette.Length))
+        {
+            var points = BuildPoints(s.Points, maxY);
+            chartLines.Add(new ChartLine(s.Host, Palette[colorIndex % Palette.Length], points, s.Total));
+            colorIndex++;
+        }
+
+        yTicks = BuildYTicks(maxY);
+
+        if (chartSeries.Count > 0 && chartSeries[0].Points.Count > 0)
+        {
+            var pts = chartSeries[0].Points;
+            xStartLabel = pts[0].TimeUtc.ToLocalTime().ToString("HH:mm:ss");
+            xEndLabel = pts[pts.Count - 1].TimeUtc.ToLocalTime().ToString("HH:mm:ss");
+        }
+
+        recentProblems = LogSink.Snapshot()
+            .Where(e => e.Level >= Serilog.Events.LogEventLevel.Warning)
+            .OrderByDescending(e => e.Id)
+            .Take(8)
+            .ToList();
+    }
+
+    private static string BuildPoints(IReadOnlyList<MetricPoint> points, long maxY)
+    {
+        if (points.Count == 0) return "";
+        var sb = new System.Text.StringBuilder();
+        var spanX = PlotRight - PlotLeft;
+        var spanY = PlotBottom - PlotTop;
+        var lastIndex = Math.Max(1, points.Count - 1);
+        for (var i = 0; i < points.Count; i++)
+        {
+            var x = PlotLeft + spanX * i / lastIndex;
+            var y = PlotBottom - spanY * points[i].Count / maxY;
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(x.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(',');
+            sb.Append(y.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return sb.ToString();
+    }
+
+    private static List<YTick> BuildYTicks(long maxY)
+    {
+        var ticks = new List<YTick>();
+        const int divisions = 4;
+        var spanY = PlotBottom - PlotTop;
+        for (var i = 0; i <= divisions; i++)
+        {
+            var value = maxY * i / divisions;
+            var y = PlotBottom - spanY * i / divisions;
+            ticks.Add(new YTick(y, value.ToString("N0")));
+        }
+        return ticks;
+    }
+
+    private string WindowButtonClass(int minutes) =>
+        minutes == windowMinutes ? "admin-window-btn active" : "admin-window-btn";
+
+    /// <summary>
+    /// Renders an SVG &lt;text&gt; element. Required because Razor reserves the literal
+    /// &lt;text&gt; tag. The label is HTML-encoded; coordinates are invariant-formatted numbers.
+    /// </summary>
+    private static MarkupString SvgText(double x, double y, string anchor, string label)
+    {
+        var xs = x.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+        var ys = y.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+        var encoded = System.Net.WebUtility.HtmlEncode(label);
+        var openTag = string.Concat(
+            "<text x=\"", xs, "\" y=\"", ys,
+            "\" class=\"admin-chart-axis\" text-anchor=\"", anchor, "\">");
+        return new MarkupString(string.Concat(openTag, encoded, "</text>"));
+    }
+
+    private static string SwatchStyle(string color) => string.Concat("background:", color, ";");
+
+    private static string WarnClass(long n) => n > 0 ? "warn" : "";
+    private static string DangerClass(long n) => n > 0 ? "danger" : "";
+
+    private static string LevelClass(Serilog.Events.LogEventLevel level) => level switch
+    {
+        Serilog.Events.LogEventLevel.Fatal => "admin-log-level fatal",
+        Serilog.Events.LogEventLevel.Error => "admin-log-level error",
+        Serilog.Events.LogEventLevel.Warning => "admin-log-level warning",
+        _ => "admin-log-level"
+    };
+
+    private static string LevelShort(Serilog.Events.LogEventLevel level) => level switch
+    {
+        Serilog.Events.LogEventLevel.Verbose => "VRB",
+        Serilog.Events.LogEventLevel.Debug => "DBG",
+        Serilog.Events.LogEventLevel.Information => "INF",
+        Serilog.Events.LogEventLevel.Warning => "WRN",
+        Serilog.Events.LogEventLevel.Error => "ERR",
+        Serilog.Events.LogEventLevel.Fatal => "FTL",
+        _ => "???"
+    };
+
+    public void Dispose()
+    {
+        refreshTimer?.Dispose();
+    }
+}

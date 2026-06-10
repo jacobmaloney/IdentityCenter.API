@@ -1,0 +1,28 @@
+@namespace IdentityCenter.API.AdminUi
+<CascadingAuthenticationState>
+    <CascadingValue Value="@AntiforgeryToken" Name="AntiforgeryToken">
+        <Router AppAssembly="@typeof(App).Assembly">
+            <Found Context="routeData">
+                <AuthorizeRouteView RouteData="@routeData" DefaultLayout="@typeof(Shared.AdminLayout)">
+                    <NotAuthorized>
+                        @* The host page (_AdminHost) already challenges unauthenticated browsers to
+                           /admin/login; this is the in-circuit fallback if a session expires mid-use. *@
+                        <div class="admin-page">
+                            <p>Your session has ended. <a href="/admin/login">Sign in again</a>.</p>
+                        </div>
+                    </NotAuthorized>
+                </AuthorizeRouteView>
+            </Found>
+            <NotFound>
+                <LayoutView Layout="@typeof(Shared.AdminLayout)">
+                    <div class="admin-page"><p>Page not found.</p></div>
+                </LayoutView>
+            </NotFound>
+        </Router>
+    </CascadingValue>
+</CascadingAuthenticationState>
+
+@code {
+    /// <summary>Antiforgery request token minted by _AdminHost.cshtml; flows to the layout's logout form.</summary>
+    [Parameter] public string? AntiforgeryToken { get; set; }
+}

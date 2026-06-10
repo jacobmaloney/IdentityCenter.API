@@ -175,7 +175,8 @@ public static class LandingPage
     </div>
 
     <div class="actions">
-      <a class="btn btn-primary" href="/swagger">API Docs (Swagger)</a>
+      <a class="btn btn-primary" href="/admin">Admin Sign In</a>
+      <a class="btn btn-ghost" href="/swagger">API Docs (Swagger)</a>
       <a class="btn btn-ghost" href="/api/admin/health">Health</a>
       <a class="btn btn-ghost" href="/swagger/v1/swagger.json">OpenAPI JSON</a>
     </div>

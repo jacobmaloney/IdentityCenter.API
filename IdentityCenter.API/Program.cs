@@ -1,12 +1,18 @@
 using System.IO;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Common.Encryption;
 using DataAccessLibrary.ControlPlane;
+using DataAccessLibrary.Data;
+using DataAccessLibrary.Models;
 using DataAccessLibrary.Repositories;
 using DataAccessLibrary.Services;
 using IdentityCenter.API.Authentication;
 using IdentityCenter.API.Middleware;
+using IdentityCenter.API.Services;
 using Logging;
 using Serilog;
 
@@ -55,6 +61,10 @@ Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .Enrich.FromLogContext()
     .WriteTo.Console()
+    // In-memory ring buffer (last 2000 events) backing the /admin/logs live view. The static
+    // Instance is used because Log.Logger is configured before the DI container exists; the
+    // same instance is registered in DI below so the UI reads the buffer this logger fills.
+    .WriteTo.Sink(InMemoryLogSink.Instance)
     .WriteTo.File(
         Path.Combine(logDirectory, "identitycenter-api-.log"),
         rollingInterval: RollingInterval.Day,
@@ -183,8 +193,78 @@ builder.Services.AddHostedService<IdentityCenter.API.Services.PostProcessHostedS
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<IAuditLogService, SystemAuditService>();
 
-// Add authentication
-builder.Services.AddAuthentication("ApiKey")
+// ── Admin UI (Blazor Server + Razor Pages) ──────────────────────────────────
+// Browser-facing admin surface at /admin: cookie login (same ASP.NET Identity binaries and
+// database as the IdentityCenter WebPortal, so portal credentials work unchanged), live log
+// viewer, live per-host traffic graph. The REST surface is untouched: X-API-Key remains the
+// DEFAULT scheme and cookies are only honored on /admin//_blazor paths (middleware below).
+builder.Services.AddRazorPages();
+builder.Services.AddServerSideBlazor();
+builder.Services.AddMemoryCache(); // BrandingService cache
+
+// EF Identity store — SAME ApplicationDbContext/ApplicationUser as the WebPortal, pointed at
+// DefaultConnection (this box's IC database). Used ONLY by the admin login; all API data access
+// remains Dapper through the tenant-aware repositories.
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")
+        ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.")));
+
+// Identity options mirror WebPortal/Program.cs exactly (password policy + 5-attempt/30-minute
+// lockout) so credential behavior — including lockout state, which lives in the shared
+// AspNetUsers table — is identical across both apps.
+builder.Services.AddIdentity<ApplicationUser, ApplicationRole>(options =>
+    {
+        options.SignIn.RequireConfirmedAccount = false;
+        options.Password.RequireDigit = true;
+        options.Password.RequireLowercase = true;
+        options.Password.RequireUppercase = true;
+        options.Password.RequireNonAlphanumeric = true;
+        options.Password.RequiredLength = 8;
+        options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(30);
+        options.Lockout.MaxFailedAccessAttempts = 5;
+    })
+    .AddEntityFrameworkStores<ApplicationDbContext>()
+    .AddDefaultTokenProviders();
+
+builder.Services.ConfigureApplicationCookie(options =>
+{
+    options.LoginPath = "/admin/login";
+    options.LogoutPath = "/admin/logout";
+    options.AccessDeniedPath = "/admin/login";
+    options.SlidingExpiration = true;
+    options.ExpireTimeSpan = TimeSpan.FromMinutes(30);
+    options.Cookie.Name = "IdentityCenter.Api.Admin";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.IsEssential = true;
+    // DELIBERATE divergence from the WebPortal (which uses Always): this service is deployed on
+    // plain HTTP :8080 inside the lab LAN; Secure-only cookies would silently never be stored
+    // and login would loop. SameAsRequest upgrades to Secure automatically once the service is
+    // fronted by HTTPS. Flagged in the deployment notes.
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.Cookie.SameSite = SameSiteMode.Lax;
+});
+
+// Admin UI plumbing: live telemetry store + middleware source, log ring buffer + file reader,
+// dedicated login throttle (the global rate limiter exempts the admin surface).
+builder.Services.AddSingleton<RequestMetricsStore>();
+builder.Services.AddSingleton(InMemoryLogSink.Instance);
+builder.Services.AddSingleton<LogFileService>();
+builder.Services.AddSingleton<LoginAttemptThrottle>();
+builder.Services.AddSingleton<IBrandingService, BrandingService>();
+
+// Add authentication.
+// ORDER MATTERS: AddIdentity (above) sets the Identity cookie as the default authenticate/
+// challenge scheme. This call runs AFTER it and re-asserts X-API-Key as the default for
+// EVERYTHING — API endpoints keep exactly their pre-admin-UI behavior (401 JSON challenges,
+// key-based identity). The admin UI opts INTO the cookie scheme explicitly: the AdminUi policy
+// names IdentityConstants.ApplicationScheme, and the scheme-selection middleware below applies
+// the cookie principal on /admin//_blazor paths only.
+builder.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme = "ApiKey";
+        options.DefaultAuthenticateScheme = "ApiKey";
+        options.DefaultChallengeScheme = "ApiKey";
+    })
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>("ApiKey", options => { });
 
 // TenantData authorization handler (admin/tenant separation for tenant-data endpoints).
@@ -211,6 +291,14 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("TenantDataPolicy", policy =>
         policy.RequireAuthenticatedUser()
               .AddRequirements(new IdentityCenter.API.Authentication.TenantDataRequirement()));
+
+    // AdminUi = the browser-facing admin surface (/admin host page + Blazor pages). COOKIE
+    // scheme only — an API key can never open the admin UI, and because no other policy names
+    // the cookie scheme, a browser cookie can never satisfy an API policy. Admin role required.
+    options.AddPolicy("AdminUi", policy =>
+        policy.AddAuthenticationSchemes(IdentityConstants.ApplicationScheme)
+              .RequireAuthenticatedUser()
+              .RequireRole("Admin"));
 
     // Deny-by-default: any endpoint without explicit authorization metadata requires an
     // authenticated caller. Endpoints intentionally public (health, agent install-script)
@@ -272,12 +360,12 @@ if (!app.Environment.IsDevelopment())
     app.UseHsts();
 }
 
-// Security response headers. This is a REST/JSON API with no HTML UI, so the CSP is strict:
-// nothing may be loaded or framed. Two HTML surfaces are exempted from the strict CSP:
-//   (1) the Swagger UI (dev/opt-in only), which needs its own assets to work; and
-//   (2) the anonymous branded landing page at "/", which renders inline CSS + an inline SVG.
-// The landing page gets a deliberately scoped page-CSP (self + inline styles + data: images);
-// the JSON/API surface keeps the locked-down default-src 'none'.
+// Security response headers. The JSON/API surface keeps a locked-down default-src 'none' CSP:
+// nothing may be loaded or framed. Three HTML surfaces carry scoped exemptions:
+//   (1) the Swagger UI (dev/opt-in only), which needs its own assets to work;
+//   (2) the anonymous branded landing page at "/", which renders inline CSS + an inline SVG;
+//   (3) the admin UI (/admin + the Blazor circuit + the copied IC design-system CSS), which
+//       needs self-hosted script (blazor.server.js), inline styles, and websockets.
 app.Use(async (context, next) =>
 {
     var headers = context.Response.Headers;
@@ -289,6 +377,11 @@ app.Use(async (context, next) =>
     var path = context.Request.Path;
     var isSwagger = path.StartsWithSegments("/swagger");
     var isLanding = path == "/" || path.StartsWithSegments("/index.html");
+    var isAdminUi = path.StartsWithSegments("/admin")
+        || path.StartsWithSegments("/_blazor")
+        || path.StartsWithSegments("/_framework")
+        || path.StartsWithSegments("/css")
+        || path.StartsWithSegments("/favicon.ico");
 
     if (isLanding)
     {
@@ -299,6 +392,18 @@ app.Use(async (context, next) =>
             "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
             "script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
     }
+    else if (isAdminUi)
+    {
+        // Admin UI CSP: scripts from self ONLY (blazor.server.js — there is deliberately no
+        // inline script anywhere on the admin surface); inline styles allowed (the IC design
+        // system and Blazor components use style attributes); websockets for the Blazor
+        // circuit. Log content is rendered exclusively through Blazor's auto-encoding, never
+        // as MarkupString — synced directory data that lands in logs stays inert text.
+        headers["Content-Security-Policy"] =
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; " +
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
+    }
     else if (!isSwagger)
     {
         headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'";
@@ -307,12 +412,48 @@ app.Use(async (context, next) =>
 });
 
 app.UseHttpsRedirection();
+
+// Static assets for the admin UI (the copied IC design-system CSS + admin.css). Placed after
+// the security-header middleware so even static responses carry nosniff/CSP.
+app.UseStaticFiles();
+
 app.UseCors("AllowWebPortal");
 
-// Add rate limiting middleware
-app.UseMiddleware<RateLimitingMiddleware>();
-
 app.UseAuthentication();
+
+// ── Cookie principal for the admin UI surface ONLY ──────────────────────────
+// UseAuthentication above ran the DEFAULT scheme (ApiKey). For the browser-facing admin
+// surface we additionally evaluate the Identity application cookie and, when valid, make it
+// the request principal. Scoped strictly to /admin + the Blazor hub: /api/* never sees a
+// cookie identity (so a lured browser can't ride its admin cookie into API endpoints), and
+// API keys never authenticate the admin UI (the AdminUi policy names the cookie scheme only).
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path;
+    // /_framework is included because MapBlazorHub serves blazor.server.js as an ENDPOINT with
+    // no auth metadata — the deny-by-default FallbackPolicy would 401 it unless the admin
+    // cookie principal is honored there too (the unauthenticated login page never loads it).
+    if (path.StartsWithSegments("/admin")
+        || path.StartsWithSegments("/_blazor")
+        || path.StartsWithSegments("/_framework"))
+    {
+        var cookieAuth = await context.AuthenticateAsync(IdentityConstants.ApplicationScheme);
+        if (cookieAuth.Succeeded && cookieAuth.Principal is not null)
+        {
+            context.User = cookieAuth.Principal;
+        }
+    }
+    await next();
+});
+
+// Request telemetry for the /admin dashboard. After authentication, BEFORE the rate limiter,
+// so throttled (429) and unauthenticated (401) responses are graphed along with the rest.
+app.UseMiddleware<RequestMetricsMiddleware>();
+
+// Rate limiting. MOVED after UseAuthentication (2026-06-09 review HIGH): the limiter keys off
+// the authenticated principal's claims; when it ran before authentication every caller —
+// Conduit and agents included — was treated as anonymous (30/min by IP).
+app.UseMiddleware<RateLimitingMiddleware>();
 
 // Install the per-request tenant connection routing AFTER authentication (so context.User is populated)
 // and BEFORE authorization + the controller (so the ambient resolver is live for the action). This MUST
@@ -335,5 +476,10 @@ app.MapGet("/", (IWebHostEnvironment env) =>
    .ExcludeFromDescription();
 
 app.MapControllers();
+
+// Admin UI endpoints: the login/logout Razor Pages + the Blazor host page (_AdminHost,
+// catch-all under /admin, gated by the AdminUi cookie policy) + the Blazor SignalR hub.
+app.MapRazorPages();
+app.MapBlazorHub();
 
 app.Run();

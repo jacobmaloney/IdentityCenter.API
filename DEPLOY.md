@@ -53,6 +53,28 @@ the service.
 In Conduit → **Connected Systems** → the **IdentityCenter** connection → set **Base URL** to
 `http://192.168.1.56:8080`, **Test**, **Save**. (Was `http://localhost:5062` when the API ran on the laptop.)
 
+## Admin UI (added 2026-06-09)
+
+The service now hosts a browser admin surface alongside the REST API — same binary, same port:
+
+- **`http://<server>:8080/admin`** — dashboard: live requests-per-host line graph (5/15/30-min
+  windows), 4xx/5xx/latency stat cards, recent warnings/errors feed. Updates every 2 s.
+- **`http://<server>:8080/admin/logs`** — live log viewer (in-memory stream, newest first,
+  level filter + text search + follow/pause) and a file mode that tails the rolling logs in
+  `C:\ProgramData\IdentityCenter\logs` (locked to that directory).
+- **`/admin/login`** — sign in with your **IdentityCenter portal credentials**
+  (`admin@identitycenter.local` / portal password). Same ASP.NET Identity stack and the same
+  `AspNetUsers` table as the WebPortal — lockout state is shared. Admin role required.
+
+Notes:
+- The REST surface is unchanged: `/api/*` still authenticates with `X-API-Key` only; the admin
+  cookie is honored on `/admin` paths only.
+- The admin cookie is `Secure` only when served over HTTPS (the service runs plain HTTP on the
+  LAN today — front it with HTTPS before exposing it beyond the LAN).
+- External IDP sign-in is NOT wired yet; the login page has the extension point marked for the
+  shared IdentityProviders configuration.
+- Telemetry/log stream are in-memory and reset on service restart (files remain the durable log).
+
 ## Service management
 
 ```powershell

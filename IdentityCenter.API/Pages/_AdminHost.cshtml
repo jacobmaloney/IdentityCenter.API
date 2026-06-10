@@ -1,0 +1,31 @@
+@page "/admin/{*clientPath:nonfile}"
+@using Microsoft.AspNetCore.Antiforgery
+@model IdentityCenter.API.Pages.AdminHostModel
+@inject IAntiforgery Antiforgery
+@{
+    Layout = null;
+    // Request token for the layout's POST /admin/logout form (Blazor components can't tag-helper
+    // a token themselves; minting it here ties it to this authenticated request/cookie).
+    var antiforgeryToken = Antiforgery.GetAndStoreTokens(HttpContext).RequestToken ?? string.Empty;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IdentityCenter API — Admin</title>
+    <base href="/" />
+    <link rel="stylesheet" href="~/css/bootstrap/bootstrap.min.css" />
+    <link rel="stylesheet" href="~/css/design-tokens.css" />
+    <link rel="stylesheet" href="~/css/dark-theme.css" />
+    <link rel="stylesheet" href="~/css/components.css" />
+    <link rel="stylesheet" href="~/css/admin.css" />
+</head>
+<body>
+    @* ServerPrerendered: first paint is server-rendered HTML (fast + verifiable), then the
+       circuit takes over for live updates. *@
+    <component type="typeof(IdentityCenter.API.AdminUi.App)" render-mode="ServerPrerendered"
+               param-AntiforgeryToken="antiforgeryToken" />
+    <script src="_framework/blazor.server.js"></script>
+</body>
+</html>

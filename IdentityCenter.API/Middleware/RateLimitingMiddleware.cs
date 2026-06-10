@@ -5,6 +5,13 @@ namespace IdentityCenter.API.Middleware;
 /// <summary>
 /// Simple sliding window rate limiting middleware.
 /// Limits: 100 req/min for agents, 1000 req/min for admin users.
+///
+/// MUST be registered AFTER UseAuthentication() — the per-key limits are driven by the
+/// authenticated principal's claims (key_type / NameIdentifier). When this middleware ran
+/// before authentication (pre-2026-06-09), context.User was always empty, so every caller —
+/// including authenticated agents and Conduit — was keyed by IP at the ANONYMOUS limit
+/// (30/min). That was the 2026-06-09 review HIGH; the registration order in Program.cs is
+/// now the fix's other half.
 /// </summary>
 public class RateLimitingMiddleware
 {
@@ -13,6 +20,12 @@ public class RateLimitingMiddleware
 
     // Sliding window tracking: key -> list of request timestamps
     private static readonly ConcurrentDictionary<string, SlidingWindow> _requestWindows = new();
+
+    // Eviction: windows idle longer than this are dropped so the dictionary cannot grow
+    // unbounded under IP churn (review finding: it previously never evicted).
+    private static readonly TimeSpan IdleEvictionAge = TimeSpan.FromMinutes(10);
+    private static DateTime _lastEvictionSweep = DateTime.UtcNow;
+    private static readonly object _evictionLock = new();
 
     // Rate limits per minute
     private const int AgentRateLimit = 100;
@@ -28,8 +41,23 @@ public class RateLimitingMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
+        // The browser-facing admin UI is exempt from the API rate limiter:
+        //  - static assets + the Blazor SignalR hub generate legitimate bursts that would
+        //    instantly trip the anonymous limit (a page load is ~10 requests);
+        //  - the login POST has its own dedicated per-IP throttle inside the login page
+        //    (LoginAttemptThrottle) plus ASP.NET Identity account lockout;
+        //  - everything else under /admin requires an authenticated admin cookie anyway.
+        // /api/* and all other surfaces remain rate limited exactly as before.
+        if (IsAdminUiSurface(context.Request.Path))
+        {
+            await _next(context);
+            return;
+        }
+
         var clientKey = GetClientKey(context);
         var rateLimit = GetRateLimit(context);
+
+        EvictIdleWindows();
 
         var window = _requestWindows.GetOrAdd(clientKey, _ => new SlidingWindow());
 
@@ -63,6 +91,40 @@ public class RateLimitingMiddleware
         await _next(context);
     }
 
+    private static bool IsAdminUiSurface(PathString path) =>
+        path.StartsWithSegments("/admin")
+        || path.StartsWithSegments("/_blazor")
+        || path.StartsWithSegments("/_framework")
+        || path.StartsWithSegments("/css")
+        || path.StartsWithSegments("/favicon.ico");
+
+    /// <summary>
+    /// Drops windows that have been idle past <see cref="IdleEvictionAge"/>. Sweeps at most
+    /// once per minute, and only one thread sweeps at a time; everyone else proceeds.
+    /// </summary>
+    private static void EvictIdleWindows()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastEvictionSweep < TimeSpan.FromMinutes(1)) return;
+
+        if (!System.Threading.Monitor.TryEnter(_evictionLock)) return;
+        try
+        {
+            if (now - _lastEvictionSweep < TimeSpan.FromMinutes(1)) return;
+            _lastEvictionSweep = now;
+
+            foreach (var entry in _requestWindows)
+            {
+                if (now - entry.Value.LastSeenUtc > IdleEvictionAge)
+                    _requestWindows.TryRemove(entry.Key, out _);
+            }
+        }
+        finally
+        {
+            System.Threading.Monitor.Exit(_evictionLock);
+        }
+    }
+
     private static string GetClientKey(HttpContext context)
     {
         // Use API key ID if authenticated, otherwise use IP
@@ -88,7 +150,7 @@ public class RateLimitingMiddleware
         return keyType?.ToLower() switch
         {
             "agent" => AgentRateLimit,
-            "admin" or "user" => AdminRateLimit,
+            "admin" or "user" or "controlplaneadmin" or "tenant" => AdminRateLimit,
             _ => AnonymousRateLimit
         };
     }
@@ -102,11 +164,15 @@ public class SlidingWindow
     private readonly object _lock = new();
     private readonly Queue<DateTime> _requests = new();
 
+    /// <summary>Last time this window saw any activity (UTC). Drives idle eviction.</summary>
+    public DateTime LastSeenUtc { get; private set; } = DateTime.UtcNow;
+
     public bool TryAddRequest(int limit, int windowSizeSeconds)
     {
         lock (_lock)
         {
             var now = DateTime.UtcNow;
+            LastSeenUtc = now;
             var cutoff = now.AddSeconds(-windowSizeSeconds);
 
             // Remove old requests outside the window
