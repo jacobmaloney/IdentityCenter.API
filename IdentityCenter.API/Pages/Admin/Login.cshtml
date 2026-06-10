@@ -45,19 +45,35 @@
             <p>API Administration — sign in to your account</p>
         </div>
 
-        @*
-          ── External identity provider extension point ─────────────────────────────────
-          When Jacob wires the shared IDP configuration in (the WebPortal's IdentityProviders
-          table lives in the same database), the provider buttons mount HERE — same structure
-          as WebPortal/Areas/Identity/Pages/Account/Login.cshtml:
+        @* External identity providers from the SHARED IdentityProviders table (configured on
+           the IdentityCenter portal's configuration page; this block is the WebPortal login's
+           provider section minus the FontAwesome icons — admin CSP allows no CDN). Hidden
+           entirely when no provider is configured, which keeps the page exactly as before. *@
+        @if (Model.ExternalProviders.Any())
+        {
+            <div class="text-center">
+                <p class="mb-3" style="color: var(--color-text-secondary);">Sign in with your organization account</p>
 
-            @@foreach (var provider in Model.ExternalProviders) { … "Sign in with …" button … }
-            <div class="login-divider"><span>Or sign in with your local account</span></div>
+                @foreach (var provider in Model.ExternalProviders)
+                {
+                    <form method="post" asp-page="./ExternalLogin" asp-route-returnUrl="@Model.ReturnUrl" class="mb-2">
+                        <input type="hidden" name="provider" value="@provider.Name" />
+                        @if (provider.Type == "AzureAD")
+                        {
+                            <button type="submit" class="login-external-btn">Sign in with Microsoft</button>
+                        }
+                        else
+                        {
+                            <button type="submit" class="login-external-btn">Sign in with @provider.Name</button>
+                        }
+                    </form>
+                }
 
-          The .login-external-btn and .login-divider styles are already present in the copied
-          components.css, so no CSS work is needed when that lands. Nothing reads the provider
-          table today — local credentials only, by design.
-        *@
+                <div class="login-divider">
+                    <span>Or sign in with your local account</span>
+                </div>
+            </div>
+        }
 
         <form id="account" method="post" class="login-form">
             <div asp-validation-summary="ModelOnly" class="text-danger"></div>

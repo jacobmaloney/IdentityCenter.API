@@ -159,6 +159,11 @@ builder.Services.AddScoped<IApiKeyRepository, ApiKeyRepository>();
 // routing is implicit via DapperRepositoryBase + TenantConnectionAccessor.
 builder.Services.AddScoped<IConfigurationRepository, ConfigurationRepository>();
 builder.Services.AddScoped<IAgentRepository, AgentRepository>();
+// IAdminRepository backs the admin login's external-IDP support (reads the SHARED
+// IdentityProviders table the WebPortal's configuration page writes). It is the same forked
+// DataAccessLibrary repository the portal uses; its ctor needs IChangeHistoryService.
+builder.Services.AddScoped<ChangeHistory.Services.IChangeHistoryService, ChangeHistory.Services.ChangeHistoryService>();
+builder.Services.AddScoped<IAdminRepository, AdminRepository>();
 builder.Services.AddScoped<ISqlLicenseRepository, SqlLicenseRepository>();
 builder.Services.AddScoped<ISqlLicenseComplianceEngine, SqlLicenseComplianceEngine>();
 
@@ -259,13 +264,40 @@ builder.Services.AddSingleton<IBrandingService, BrandingService>();
 // key-based identity). The admin UI opts INTO the cookie scheme explicitly: the AdminUi policy
 // names IdentityConstants.ApplicationScheme, and the scheme-selection middleware below applies
 // the cookie principal on /admin//_blazor paths only.
-builder.Services.AddAuthentication(options =>
+// NOTE: AddIdentity (above) already set DefaultSignInScheme = Identity.External and this delegate
+// deliberately does NOT override it — the dynamically registered external IDP schemes (below)
+// sign their callback principal into that external cookie, exactly like the WebPortal.
+var authBuilder = builder.Services.AddAuthentication(options =>
     {
         options.DefaultScheme = "ApiKey";
         options.DefaultAuthenticateScheme = "ApiKey";
         options.DefaultChallengeScheme = "ApiKey";
     })
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>("ApiKey", options => { });
+
+// ── External IDP sign-in for the admin login (ported from the WebPortal) ────
+// Reads the SHARED IdentityProviders table (written by the portal's configuration page) and
+// registers one OIDC/OAuth scheme per enabled provider. STARTUP-TIME, same as the portal: a
+// provider configured in IC after this service starts needs a service RESTART to appear on
+// /admin/login. Failures here must never stop the API — local password login (and the entire
+// X-API-Key surface) work regardless.
+using (var tempServiceProvider = builder.Services.BuildServiceProvider(
+           new ServiceProviderOptions { ValidateOnBuild = false, ValidateScopes = false }))
+{
+    using var startupLoggerFactory = LoggerFactory.Create(lb => lb.AddSerilog(Log.Logger));
+    var startupLogger = startupLoggerFactory.CreateLogger("DynamicAuthentication");
+    try
+    {
+        startupLogger.LogInformation("Attempting to register dynamic authentication providers");
+        await authBuilder.AddDynamicProvidersAsync(tempServiceProvider, startupLogger);
+    }
+    catch (Exception ex)
+    {
+        startupLogger.LogWarning(ex,
+            "Could not register dynamic authentication providers during startup. " +
+            "This is expected if the database is not yet configured.");
+    }
+}
 
 // TenantData authorization handler (admin/tenant separation for tenant-data endpoints).
 builder.Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationHandler,

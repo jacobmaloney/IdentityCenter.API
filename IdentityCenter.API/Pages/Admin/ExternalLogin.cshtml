@@ -1,0 +1,18 @@
+@page "/admin/external-login"
+@model IdentityCenter.API.Pages.Admin.ExternalLoginModel
+@{
+    Layout = null;
+}
+@* This page never renders in the normal flow — OnPost issues the OIDC challenge and the
+   callback handler redirects to /admin or back to /admin/login with an error. It exists as
+   a Razor Page (not a controller) to mirror the WebPortal's ExternalLogin page structure. *@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>External sign-in</title>
+</head>
+<body>
+    <p>Redirecting&hellip;</p>
+</body>
+</html>

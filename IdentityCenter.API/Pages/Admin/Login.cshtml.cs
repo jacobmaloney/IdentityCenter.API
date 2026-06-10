@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using DataAccessLibrary.Models;
+using DataAccessLibrary.Repositories;
 using DataAccessLibrary.Services;
 using IdentityCenter.API.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -20,8 +21,11 @@ namespace IdentityCenter.API.Pages.Admin;
 ///   - per-IP attempt throttle (<see cref="LoginAttemptThrottle"/>) — the API's global rate
 ///     limiter exempts the admin UI surface, so the login POST carries its own gate;
 ///   - no 2FA flow, no forgot-password, no self-registration — those live in the WebPortal;
-///   - no external-IDP handling YET: the extension point is marked in Login.cshtml; Jacob wires
-///     the shared IDP configuration himself (do not implement it here).
+///   - external-IDP sign-in (ExternalLogin.cshtml.cs) shows one button per enabled provider in
+///     the SHARED IdentityProviders table (the portal's configuration page writes it). Buttons
+///     render only for providers whose authentication scheme actually registered at startup —
+///     a provider configured in the portal AFTER this service started needs a service restart
+///     to appear here (same startup-time registration model as the portal itself).
 /// </summary>
 [AllowAnonymous]
 public class LoginModel : PageModel
@@ -31,23 +35,38 @@ public class LoginModel : PageModel
     private readonly ILogger<LoginModel> _logger;
     private readonly IBrandingService _brandingService;
     private readonly LoginAttemptThrottle _throttle;
+    private readonly IAdminRepository _adminRepo;
 
     public LoginModel(
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
         ILogger<LoginModel> logger,
         IBrandingService brandingService,
-        LoginAttemptThrottle throttle)
+        LoginAttemptThrottle throttle,
+        IAdminRepository adminRepo)
     {
         _signInManager = signInManager;
         _userManager = userManager;
         _logger = logger;
         _brandingService = brandingService;
         _throttle = throttle;
+        _adminRepo = adminRepo;
     }
 
     public string ProductName { get; set; } = "IdentityCenter";
     public string? LogoDataUri { get; set; }
+
+    /// <summary>
+    /// Enabled external providers from the SHARED IdentityProviders table (written by the
+    /// IdentityCenter portal's configuration page), filtered to those whose authentication
+    /// scheme actually registered at startup. Empty (today's default) renders the page exactly
+    /// as before the external sign-in support existed.
+    /// </summary>
+    public List<IdentityProvider> ExternalProviders { get; set; } = new();
+
+    /// <summary>Set by ExternalLogin.cshtml.cs when a callback fails; surfaced as a ModelState error.</summary>
+    [TempData]
+    public string? ErrorMessage { get; set; }
 
     [BindProperty]
     public InputModel Input { get; set; } = new();
@@ -75,7 +94,11 @@ public class LoginModel : PageModel
         if (User.Identity?.IsAuthenticated == true && User.IsInRole("Admin"))
             return LocalRedirect(ReturnUrl);
 
+        if (!string.IsNullOrEmpty(ErrorMessage))
+            ModelState.AddModelError(string.Empty, ErrorMessage);
+
         await LoadBrandingAsync();
+        await LoadExternalProvidersAsync();
         return Page();
     }
 
@@ -83,6 +106,7 @@ public class LoginModel : PageModel
     {
         ReturnUrl = SanitizeReturnUrl(returnUrl);
         await LoadBrandingAsync();
+        await LoadExternalProvidersAsync();
 
         if (!ModelState.IsValid)
             return Page();
@@ -162,6 +186,35 @@ public class LoginModel : PageModel
             _logger.LogError(ex, "Unexpected error during admin UI login attempt for user {Email}", Input?.Email);
             ModelState.AddModelError(string.Empty, "An unexpected error occurred during sign-in. Please try again later.");
             return Page();
+        }
+    }
+
+    /// <summary>
+    /// Same load as the WebPortal login page (enabled, non-Local providers via Dapper), with
+    /// one extra guard: intersect with the schemes that actually registered at startup so a
+    /// provider row added after boot never renders a button that would fail to challenge.
+    /// Any failure here degrades to local-password-only — the page must always render.
+    /// </summary>
+    private async Task LoadExternalProvidersAsync()
+    {
+        try
+        {
+            var registeredSchemes = (await _signInManager.GetExternalAuthenticationSchemesAsync())
+                .Select(s => s.Name)
+                .ToHashSet(StringComparer.Ordinal);
+
+            if (registeredSchemes.Count == 0)
+                return; // nothing registered → keep the empty default, no DB query needed
+
+            var providers = await _adminRepo.GetEnabledIdentityProvidersAsync();
+            ExternalProviders = providers
+                .Where(p => p.Type != "Local" && registeredSchemes.Contains(p.Name))
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not load external identity providers for admin login; showing local login only");
+            ExternalProviders = new List<IdentityProvider>();
         }
     }
 
