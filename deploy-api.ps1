@@ -152,6 +152,12 @@ if (-not $Credential) {
 }
 $plainPwd = $Credential.GetNetworkCredential().Password
 $netUser  = $Credential.UserName
+
+# From the SMB connect onward, run inside try/finally so the authenticated C$ mapping is
+# ALWAYS torn down and the plaintext password ALWAYS cleared -- on success, on every error
+# exit, and on the dry-run exit. A PowerShell 'finally' runs before 'exit' takes effect,
+# so the teardown fires on all paths below while the original exit codes are preserved.
+try {
 & net use $smbRoot $plainPwd /user:$netUser | Out-Null
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $RemotePath)) {
     Write-Err2 "Could not access $RemotePath over SMB. Check credentials / .56 reachability (the VM may have slept -- retry)."
@@ -252,4 +258,17 @@ else {
     Write-Host "   C:\ProgramData\IdentityCenter\logs  (Serilog file sink -- OUTSIDE the publish root)" -ForegroundColor Red
     Write-Host ("=" * 64) -ForegroundColor Cyan
     exit 1
+}
+}
+finally {
+    # Always tear down the authenticated C$ mapping and scrub the plaintext password,
+    # on every exit path above (success, error, dry-run). net use /delete errors when
+    # there is no mapping; relax EAP around just the delete (same pattern as start-of-script).
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & net use $smbRoot /delete /y 2>$null | Out-Null
+    $ErrorActionPreference = $prevEAP
+
+    $plainPwd = $null
+    if ($Credential) { $Credential = $null }
 }
