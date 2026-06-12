@@ -238,6 +238,26 @@ survives reboot, no console window.** `Program.cs` calls `builder.Host.UseWindow
 > **Repo divergence:** the `builder.Host.UseWindowsService()` line in `Program.cs` is a deliberate,
 > deployment-only difference from the IdentityCenter-repo copy. Do **not** mirror it upstream.
 
+### Safe redeploy of the .56 service (`deploy-api.ps1`)
+
+`deploy-api.ps1` mirrors a fresh self-contained publish to the running `IdentityCenterApi`
+service on `192.168.1.56` and health-checks it. It uses `robocopy /MIR` but excludes
+runtime-written dirs by **full remote path** (`/XD`) so the mirror can never delete
+server-only state, and it relaxes `$ErrorActionPreference` around the one `net use /delete`
+call (whose native stderr would otherwise abort the script). The API writes nothing under its
+publish root — logs go to `C:\ProgramData\IdentityCenter\logs` and the DataProtection keyring
+to `C:\ProgramData\IdentityCenter\Keys`, both **outside** the publish root — so the exclude
+set is purely defensive (`log`, `App_Data`, `uploads`, `temp`; no `MLModels`, unlike WebPortal).
+
+```powershell
+.\publish.ps1 -SelfContained                          # stage ./publish first
+.\deploy-api.ps1 -DryRun                               # prove the excludes (prompts for SMB pwd)
+.\deploy-api.ps1 -SmbUser "domain\administrator"       # real deploy (stop -> mirror -> start -> health)
+```
+
+Pass the SMB credential via `-Credential`, or `-SmbUser` (+`-SmbPassword`), or be prompted —
+**no secret is stored in the script.**
+
 ---
 
 ## Drift note (IMPORTANT)
