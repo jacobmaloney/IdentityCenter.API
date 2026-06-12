@@ -166,6 +166,12 @@ builder.Services.AddScoped<ChangeHistory.Services.IChangeHistoryService, ChangeH
 builder.Services.AddScoped<IAdminRepository, AdminRepository>();
 builder.Services.AddScoped<ISqlLicenseRepository, SqlLicenseRepository>();
 builder.Services.AddScoped<ISqlLicenseComplianceEngine, SqlLicenseComplianceEngine>();
+// Agent command channel (V138 AgentCommands + V140 targeting) — backs
+// AgentCommandsController; the Conduit SQL Discovery poller consumes it via /api/agent/commands.
+builder.Services.AddScoped<IAgentCommandRepository, AgentCommandRepository>();
+// V140 Agents registry (admin-enrolled installations; per-agent keys carry agent_id).
+// Distinct from IAgentRepository, which serves the execution-server RemoteAgents channel.
+builder.Services.AddScoped<IAgentRegistryRepository, AgentRegistryRepository>();
 
 // Repositories backing the public API controllers (Prompt 11 Part 2)
 builder.Services.AddScoped<IIdentityRepository, IdentityRepository>();
@@ -308,6 +314,43 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("AgentPolicy", policy =>
         policy.RequireAuthenticatedUser()
               .RequireClaim("scope", "agent"));
+
+    // AgentChannel*Policy = the V140 per-agent command channel. Requires a per-agent
+    // key: the agent_id claim is the ONLY source of agent identity (no endpoint accepts
+    // an agentId from the caller), plus the MATCHING agent:* scope minted with the key.
+    // The scopes are deliberately NOT interchangeable: command endpoints (claim) need
+    // agent:commands and heartbeat needs agent:heartbeat, so a heartbeat-only key can
+    // never claim or complete work. Named "Channel" because "AgentPolicy" already
+    // belongs to the execution-server RemoteAgents surface above.
+    options.AddPolicy("AgentChannelCommandsPolicy", policy =>
+        policy.RequireAuthenticatedUser()
+              .RequireClaim("agent_id")
+              .RequireClaim("scope", "agent:commands"));
+
+    options.AddPolicy("AgentChannelHeartbeatPolicy", policy =>
+        policy.RequireAuthenticatedUser()
+              .RequireClaim("agent_id")
+              .RequireClaim("scope", "agent:heartbeat"));
+
+    // AgentCommandsCompletePolicy = POST /api/agent/commands/{id}/complete, which BOTH
+    // key shapes must reach: per-agent keys (KeyType=Agent + agent_id — denied by
+    // TenantDataPolicy's Agent-key rule) and legacy shared keys (allowed by the same
+    // TenantData rules as before). A key carrying agent_id must ALSO hold agent:commands
+    // (a heartbeat-only key cannot complete work). Control-plane admin keys stay denied;
+    // Agent-typed keys WITHOUT agent_id stay denied (the 2026-06-09 TenantData decision).
+    options.AddPolicy("AgentCommandsCompletePolicy", policy =>
+        policy.RequireAuthenticatedUser()
+              .RequireAssertion(ctx =>
+              {
+                  var keyType = ctx.User.FindFirst("key_type")?.Value;
+                  if (string.Equals(keyType, "ControlPlaneAdmin", StringComparison.Ordinal))
+                      return false;
+                  if (ctx.User.HasClaim(c => c.Type == "agent_id"))
+                      return ctx.User.HasClaim("scope", "agent:commands");
+                  if (string.Equals(keyType, "Agent", StringComparison.OrdinalIgnoreCase))
+                      return false;
+                  return true;
+              }));
 
     // AdminPolicy = control-plane admin scope ONLY (scope=admin). A control-plane TENANT key carries
     // scope=tenant and therefore gets 403 on AdminPolicy endpoints (/provision, /api/admin). This is the

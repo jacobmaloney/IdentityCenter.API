@@ -176,12 +176,8 @@ public class ApiKeyAuthenticationHandler : AuthenticationHandler<ApiKeyAuthentic
         return AuthenticateResult.Success(ticket);
     }
 
-    private string GetClientIpAddress()
-    {
-        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (!string.IsNullOrEmpty(forwardedFor))
-            return forwardedFor.Split(',')[0].Trim();
-
-        return Context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-    }
+    // X-Forwarded-For is honored only behind a configured trusted proxy
+    // (Api:TrustedProxies); otherwise the socket address wins. A direct caller
+    // could previously spoof its logged/stored IP with an arbitrary XFF header.
+    private string GetClientIpAddress() => ClientIp.Resolve(Context, _configuration);
 }
