@@ -65,6 +65,51 @@ public interface IObjectWriteBackService
         string source,
         WriteBackCallerContext? caller = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Create a new directory object (user, group, …) in the target system and ingest the
+    /// resulting record into the Objects table. The SINGLE create entry point — routes to the
+    /// correct connector via the write-service factory, runs the read-only-default + delegation
+    /// capability gate, and writes a Create audit row (Success=false on denial/failure, real UserId).
+    /// </summary>
+    /// <param name="connectionId">The connection the object is created in.</param>
+    /// <param name="objectClass">"user" | "group" | … (drives capability + factory routing).</param>
+    /// <param name="sourceType">"EntraID" | "ActiveDirectory" | … for schema/scope resolution.</param>
+    /// <param name="fields">Schema field key → value (already server-side validated by the caller).</param>
+    /// <param name="source">Audit source identifier (e.g. "ManualCreate").</param>
+    /// <param name="caller">Caller context. Interactive callers are subject to the capability gate.</param>
+    Task<CreateObjectResult> CreateObjectAsync(
+        Guid connectionId,
+        string objectClass,
+        string sourceType,
+        Dictionary<string, string?> fields,
+        string source,
+        WriteBackCallerContext? caller = null,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// Result of a create operation. On success the directory object exists; the local record may
+/// not yet be visible due to Graph eventual consistency (<see cref="PendingVisibility"/>).
+/// </summary>
+public class CreateObjectResult
+{
+    public bool Success { get; set; }
+    public Guid? ObjectId { get; set; }
+    /// <summary>The source-system object id (Entra object id / AD objectGUID) from the create response.</summary>
+    public string? SourceUniqueId { get; set; }
+    public string? DisplayName { get; set; }
+    /// <summary>True when the object was created but is not yet visible on immediate re-query.</summary>
+    public bool PendingVisibility { get; set; }
+    /// <summary>Typed denial reason when the capability gate blocked the create (else None).</summary>
+    public WriteDenialReason DenialReason { get; set; } = WriteDenialReason.None;
+    public List<string> Errors { get; set; } = new();
+
+    public static CreateObjectResult Failed(string error) =>
+        new() { Success = false, Errors = { error } };
+
+    public static CreateObjectResult Denied(WriteCapabilityDecision decision) =>
+        new() { Success = false, DenialReason = decision.Reason, Errors = { decision.Message } };
 }
 
 /// <summary>

@@ -99,6 +99,26 @@ public interface IDirectoryWriteService
         bool enableAccount = true);
 
     /// <summary>
+    /// Create a new group in the target directory. Returns the created object's source id
+    /// (Entra object id / AD objectGUID) and DN, or null on failure.
+    /// </summary>
+    /// <param name="connectionId">The connection to create the group in.</param>
+    /// <param name="displayName">Group display name.</param>
+    /// <param name="mailNickname">mailNickname / sAMAccountName for the group.</param>
+    /// <param name="description">Optional description.</param>
+    /// <param name="securityEnabled">True for a security group.</param>
+    /// <param name="mailEnabled">True for a mail-enabled (M365) group.</param>
+    /// <param name="targetOU">AD OU DN (ignored by cloud connectors).</param>
+    Task<DirectoryCreateResult?> CreateGroupAsync(
+        Guid connectionId,
+        string displayName,
+        string mailNickname,
+        string? description,
+        bool securityEnabled,
+        bool mailEnabled,
+        string? targetOU = null);
+
+    /// <summary>
     /// Search Active Directory for an existing user by sAMAccountName or display name.
     /// Returns objectGUID, DN, sAMAccountName, UPN, and display name if found; null if not found.
     /// </summary>
@@ -117,6 +137,18 @@ public interface IDirectoryWriteService
         string? lastName,
         string? email,
         string? knownUsername = null);
+}
+
+/// <summary>
+/// Result from creating an object in a directory.
+/// </summary>
+public class DirectoryCreateResult
+{
+    /// <summary>Source-system id (Entra object id / AD objectGUID).</summary>
+    public Guid SourceObjectGuid { get; set; }
+    public string? SourceObjectId { get; set; }
+    public string? DN { get; set; }
+    public string? DisplayName { get; set; }
 }
 
 /// <summary>

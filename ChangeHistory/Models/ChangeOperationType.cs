@@ -97,5 +97,9 @@ public enum ChangeOperationType
     IndexRebuilt,
     DataCleanedUp,
     BackupCreated,
-    BackupRestored
+    BackupRestored,
+
+    // License operations — appended at the end so existing ChangeAuditLogs int values are unchanged
+    LicenseAssigned,
+    LicenseRemoved
 }

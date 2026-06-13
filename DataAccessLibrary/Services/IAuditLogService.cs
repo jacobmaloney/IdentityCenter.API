@@ -20,6 +20,14 @@ namespace DataAccessLibrary.Services
         Task LogChangesAsync(IEnumerable<ChangeAuditEntry> entries);
 
         /// <summary>
+        /// Log a change synchronously, awaiting the insert and rethrowing on failure.
+        /// Use for high-privilege operations (app-create, license-remove) where a missing
+        /// audit row must abort the operation rather than complete silently. Unlike
+        /// LogChangeAsync (fire-and-forget) and LogChangesAsync (swallows), this surfaces failure.
+        /// </summary>
+        Task LogChangeSyncAsync(ChangeAuditEntry entry);
+
+        /// <summary>
         /// Get change history for a specific object
         /// </summary>
         Task<List<ChangeAuditEntry>> GetObjectHistoryAsync(Guid objectId, int limit = 50);
@@ -190,7 +198,11 @@ namespace DataAccessLibrary.Services
         IndexRebuilt,
         DataCleanedUp,
         BackupCreated,
-        BackupRestored
+        BackupRestored,
+
+        // License operations — appended at the end so existing ChangeAuditLogs int values are unchanged
+        LicenseAssigned,
+        LicenseRemoved
     }
 
     /// <summary>

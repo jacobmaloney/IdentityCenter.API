@@ -68,6 +68,35 @@ namespace DataAccessLibrary.Services
         }
 
         /// <inheritdoc />
+        public async Task LogChangeSyncAsync(ChangeAuditEntry entry)
+        {
+            var log = ChangeAuditLog.FromEntry(entry);
+
+            const string sql = @"
+                INSERT INTO ChangeAuditLogs (
+                    Timestamp, UserId, UserDisplayName, UserEmail, IpAddress,
+                    OperationType, EntityType, EntityId, EntityDisplayName, PropertyName,
+                    OldValue, NewValue, RelatedEntityId, RelatedEntityName,
+                    Reason, TicketNumber, ApprovedBy, ApproverName,
+                    Success, ErrorMessage, CorrelationId, Source,
+                    OnBehalfOfUserId, OnBehalfOfDisplayName
+                )
+                OUTPUT INSERTED.Id
+                VALUES (
+                    @Timestamp, @UserId, @UserDisplayName, @UserEmail, @IpAddress,
+                    @OperationType, @EntityType, @EntityId, @EntityDisplayName, @PropertyName,
+                    @OldValue, @NewValue, @RelatedEntityId, @RelatedEntityName,
+                    @Reason, @TicketNumber, @ApprovedBy, @ApproverName,
+                    @Success, @ErrorMessage, @CorrelationId, @Source,
+                    @OnBehalfOfUserId, @OnBehalfOfDisplayName
+                )";
+
+            await using var connection = new SqlConnection(_connectionString);
+            var id = await connection.ExecuteScalarAsync<long>(sql, log).ConfigureAwait(false);
+            entry.Id = id;
+        }
+
+        /// <inheritdoc />
         public async Task LogChangesAsync(IEnumerable<ChangeAuditEntry> entries)
         {
             try
