@@ -64,6 +64,9 @@ public interface ISyncObjectRepository
     Task<Dictionary<string, Guid>> GetObjectIdsByDistinguishedNamesAsync(
         Guid sourceConnectionId, List<string> distinguishedNames, CancellationToken cancellationToken = default);
 
+    Task<Dictionary<string, Guid>> GetObjectIdsByUserPrincipalNamesAsync(
+        Guid sourceConnectionId, List<string> userPrincipalNames, CancellationToken cancellationToken = default);
+
     Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(
         Guid sourceConnectionId, CancellationToken cancellationToken = default);
 
@@ -72,6 +75,9 @@ public interface ISyncObjectRepository
     Task<int> BulkUpsertObjectGroupMembershipsAsync(
         List<(Guid ObjectId, Guid GroupId, bool IsDirect, bool IsPrimary)> memberships,
         CancellationToken cancellationToken = default);
+
+    Task<int> BulkInsertSignInLogsAsync(
+        List<SignInLog> logs, CancellationToken cancellationToken = default);
 
     Task<int> MarkRemovedObjectGroupMembershipsAsync(
         Guid objectId, List<Guid> currentGroupIds, CancellationToken cancellationToken = default);

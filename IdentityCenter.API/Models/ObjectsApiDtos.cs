@@ -185,3 +185,65 @@ public class PostProcessResponse
     public Guid ConnectionId { get; set; }
     public string Message { get; set; } = string.Empty;
 }
+
+// ── Phase 2.2 Part E: sign-in event ingest ──────────────────────────────────
+
+/// <summary>
+/// Request body for <c>POST /api/objects/signin-logs/bulk</c>. Conduit pushes the
+/// Entra sign-in events it read from Graph; IC resolves each event's user to an
+/// Objects row for the connection and persists through the set-based repo
+/// primitive (<c>BulkInsertSignInLogsAsync</c>). Idempotent — re-posting the same
+/// events (keyed on <see cref="SignInLogEvent.SignInId"/>) is a no-op.
+/// </summary>
+public class SignInLogBulkRequest
+{
+    public Guid BatchId { get; set; }
+    /// <summary>
+    /// Source string identifying the connection these events belong to (same
+    /// semantics as <see cref="BulkUpsertItem.Source"/> — typically "Conduit").
+    /// Must resolve to an existing DirectoryConnection.
+    /// </summary>
+    public string Source { get; set; } = string.Empty;
+    /// <summary>Durable instance GUID of the job server (Conduit installation) that pushed
+    /// these events. Used to keep the Agents registry live (auto-register if absent).</summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
+    public IReadOnlyList<SignInLogEvent> Events { get; set; } = Array.Empty<SignInLogEvent>();
+}
+
+public class SignInLogEvent
+{
+    /// <summary>Graph sign-in event id — the idempotency key. Required.</summary>
+    public string SignInId { get; set; } = string.Empty;
+    /// <summary>Entra userId / objectGUID used to resolve the event to an Objects row.</summary>
+    public string UserSourceUniqueId { get; set; } = string.Empty;
+    /// <summary>UPN fallback resolver when UserSourceUniqueId does not match an Objects row.</summary>
+    public string? UserPrincipalName { get; set; }
+    public DateTime SignInDateTime { get; set; }
+    public string? AppDisplayName { get; set; }
+    public string? AppId { get; set; }
+    public string? ClientAppUsed { get; set; }
+    /// <summary>JSON-serialized device detail from Graph.</summary>
+    public string? DeviceDetail { get; set; }
+    public string? IpAddress { get; set; }
+    /// <summary>JSON-serialized location from Graph.</summary>
+    public string? Location { get; set; }
+    /// <summary>"Success" or "Failure".</summary>
+    public string? Status { get; set; }
+    public int? ErrorCode { get; set; }
+    public string? RiskLevel { get; set; }
+    public string? RiskState { get; set; }
+    public string? ConditionalAccessStatus { get; set; }
+    public bool IsInteractive { get; set; }
+    public string? ResourceDisplayName { get; set; }
+    public string? ResourceId { get; set; }
+}
+
+public class SignInLogBulkResponse
+{
+    public Guid BatchId { get; set; }
+    public int UsersResolved { get; set; }
+    public int UsersUnresolved { get; set; }
+    public int EventsPersisted { get; set; }
+}

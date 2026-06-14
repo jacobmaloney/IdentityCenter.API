@@ -1217,6 +1217,128 @@ public class ObjectsController : ControllerBase
         }
     }
 
+    // ── Phase 2.2 Part E: sign-in event ingest ──────────────────────────────
+
+    /// <summary>
+    /// Bulk-ingest Entra sign-in EVENTS pushed by Conduit. Resolves each event's
+    /// user to an Objects row for the connection (by SourceUniqueId, falling back
+    /// to UPN), then persists through the set-based repo primitive
+    /// (<c>BulkInsertSignInLogsAsync</c>) — no raw sign-in SQL in the controller.
+    /// Idempotent (INSERT-when-not-matched keyed on SignInId). Events whose user
+    /// does not resolve are counted and dropped, never error the batch.
+    /// </summary>
+    [HttpPost("signin-logs/bulk")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> BulkSignInLogs([FromBody] SignInLogBulkRequest request)
+    {
+        if (request is null || request.Events is null || request.Events.Count == 0)
+            return BadRequest(new { error = "Events is required and must be non-empty" });
+        if (string.IsNullOrWhiteSpace(request.Source) || !SourceNamePattern.IsMatch(request.Source))
+            return BadRequest(new { error = "A valid Source is required" });
+        if (request.Events.Count > 1000)
+            return BadRequest(new { error = "Maximum 1000 sign-in events per request" });
+
+        try
+        {
+            var connectionId = await ResolveConnectionIdAsync(request.Source);
+            if (connectionId == Guid.Empty)
+                return BadRequest(new { error = $"No active DirectoryConnection for Source '{request.Source}'" });
+
+            // Keep the Agents registry live: auto-register / refresh the pushing job
+            // server even though sign-in events don't stamp Objects directly.
+            await ResolveAndRegisterJobServerAsync(request.SourceJobServerId, request.SourceJobServerName);
+
+            // Resolve every distinct user id to an Objects.Id in one repo round-trip,
+            // then fall back to UPN for any that didn't match (Entra userId vs UPN).
+            var userIds = request.Events
+                .Select(e => e.UserSourceUniqueId)
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            var userMap = userIds.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsBySourceUniqueIdsAsync(connectionId, userIds)
+                : new Dictionary<string, Guid>();
+
+            var upns = request.Events
+                .Where(e => !string.IsNullOrWhiteSpace(e.UserPrincipalName)
+                            && (string.IsNullOrWhiteSpace(e.UserSourceUniqueId) || !userMap.ContainsKey(e.UserSourceUniqueId)))
+                .Select(e => e.UserPrincipalName!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var upnMap = upns.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsByUserPrincipalNamesAsync(connectionId, upns)
+                : new Dictionary<string, Guid>();
+
+            var logs = new List<DataAccessLibrary.Models.SignInLog>();
+            int usersResolved = 0, usersUnresolved = 0;
+
+            foreach (var e in request.Events)
+            {
+                Guid objectId;
+                if (!string.IsNullOrWhiteSpace(e.UserSourceUniqueId) && userMap.TryGetValue(e.UserSourceUniqueId, out var oId))
+                {
+                    objectId = oId;
+                }
+                else if (!string.IsNullOrWhiteSpace(e.UserPrincipalName) && upnMap.TryGetValue(e.UserPrincipalName, out var uId))
+                {
+                    objectId = uId;
+                }
+                else
+                {
+                    usersUnresolved++;
+                    continue;
+                }
+                usersResolved++;
+
+                logs.Add(new DataAccessLibrary.Models.SignInLog
+                {
+                    ObjectId = objectId,
+                    SourceConnectionId = connectionId,
+                    SignInId = e.SignInId,
+                    SignInDateTime = e.SignInDateTime,
+                    AppDisplayName = e.AppDisplayName,
+                    AppId = e.AppId,
+                    ClientAppUsed = e.ClientAppUsed,
+                    DeviceDetail = e.DeviceDetail,
+                    IpAddress = e.IpAddress,
+                    Location = e.Location,
+                    Status = e.Status,
+                    ErrorCode = e.ErrorCode,
+                    RiskLevel = e.RiskLevel,
+                    RiskState = e.RiskState,
+                    ConditionalAccessStatus = e.ConditionalAccessStatus,
+                    IsInteractive = e.IsInteractive,
+                    ResourceDisplayName = e.ResourceDisplayName,
+                    ResourceId = e.ResourceId
+                });
+            }
+
+            int persisted = 0;
+            if (logs.Count > 0)
+                persisted = await _syncObjectRepository.BulkInsertSignInLogsAsync(logs);
+
+            _logger.LogInformation(
+                "API: sign-in batch {BatchId} for '{Source}' — users {UR}/{UU}, persisted {P}",
+                request.BatchId, request.Source, usersResolved, usersUnresolved, persisted);
+
+            return Ok(new SignInLogBulkResponse
+            {
+                BatchId = request.BatchId,
+                UsersResolved = usersResolved,
+                UsersUnresolved = usersUnresolved,
+                EventsPersisted = persisted
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API: sign-in batch {BatchId} failed", request.BatchId);
+            return StatusCode(500, new { error = "Sign-in log ingest failed", batchId = request.BatchId });
+        }
+    }
+
     // ── Phase 2.2 Part C: tombstone soft-delete (DESTRUCTIVE — guardrailed) ──
 
     /// <summary>

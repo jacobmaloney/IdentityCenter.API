@@ -2293,6 +2293,51 @@ IF NOT EXISTS (SELECT 1 FROM Objects WHERE SourceConnectionId=@{p}_ConnId AND So
         }
     }
 
+    public async Task<Dictionary<string, Guid>> GetObjectIdsByUserPrincipalNamesAsync(
+        Guid sourceConnectionId,
+        List<string> userPrincipalNames,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogMethodEntry(nameof(GetObjectIdsByUserPrincipalNamesAsync),
+            new { sourceConnectionId, count = userPrincipalNames?.Count ?? 0 });
+
+        try
+        {
+            if (userPrincipalNames == null || !userPrincipalNames.Any())
+            {
+                return new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            var sql = @"
+                SELECT UserPrincipalName, Id
+                FROM Objects
+                WHERE SourceConnectionId = @SourceConnectionId
+                  AND UserPrincipalName IN @UserPrincipalNames
+            ";
+
+            var results = await connection.QueryAsync<(string UserPrincipalName, Guid Id)>(sql,
+                new { SourceConnectionId = sourceConnectionId, UserPrincipalNames = userPrincipalNames },
+                commandTimeout: 120);
+
+            var map = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in results)
+            {
+                if (!string.IsNullOrWhiteSpace(r.UserPrincipalName))
+                {
+                    map[r.UserPrincipalName] = r.Id;
+                }
+            }
+            return map;
+        }
+        finally
+        {
+            _logger.LogMethodExit(nameof(GetObjectIdsByUserPrincipalNamesAsync));
+        }
+    }
+
     public async Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(
         Guid sourceConnectionId,
         CancellationToken cancellationToken = default)
@@ -2476,6 +2521,133 @@ IF NOT EXISTS (SELECT 1 FROM Objects WHERE SourceConnectionId=@{p}_ConnId AND So
         {
             _sqlBulkCopySemaphore.Release();
             _logger.LogMethodExit(nameof(BulkUpsertObjectGroupMembershipsAsync));
+        }
+    }
+
+    public async Task<int> BulkInsertSignInLogsAsync(
+        List<SignInLog> logs,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogMethodEntry(nameof(BulkInsertSignInLogsAsync));
+
+        if (!logs.Any())
+        {
+            _logger.LogInformation("No sign-in logs to insert");
+            return 0;
+        }
+
+        await _sqlBulkCopySemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            await connection.ExecuteAsync(@"
+                CREATE TABLE #TempSignInLogs (
+                    ObjectId                 UNIQUEIDENTIFIER NOT NULL,
+                    SourceConnectionId       UNIQUEIDENTIFIER NOT NULL,
+                    SignInId                 NVARCHAR(200)    NULL,
+                    SignInDateTime           DATETIME2        NOT NULL,
+                    AppDisplayName           NVARCHAR(500)    NULL,
+                    AppId                    NVARCHAR(200)    NULL,
+                    ClientAppUsed            NVARCHAR(200)    NULL,
+                    DeviceDetail             NVARCHAR(500)    NULL,
+                    IpAddress                NVARCHAR(100)    NULL,
+                    Location                 NVARCHAR(500)    NULL,
+                    Status                   NVARCHAR(50)     NULL,
+                    ErrorCode                INT              NULL,
+                    RiskLevel                NVARCHAR(50)     NULL,
+                    RiskState                NVARCHAR(50)     NULL,
+                    ConditionalAccessStatus  NVARCHAR(50)     NULL,
+                    IsInteractive            BIT              NOT NULL,
+                    ResourceDisplayName      NVARCHAR(500)    NULL,
+                    ResourceId               NVARCHAR(200)    NULL
+                )", commandTimeout: 30);
+
+            var dataTable = new DataTable();
+            dataTable.Columns.Add("ObjectId", typeof(Guid));
+            dataTable.Columns.Add("SourceConnectionId", typeof(Guid));
+            dataTable.Columns.Add("SignInId", typeof(string));
+            dataTable.Columns.Add("SignInDateTime", typeof(DateTime));
+            dataTable.Columns.Add("AppDisplayName", typeof(string));
+            dataTable.Columns.Add("AppId", typeof(string));
+            dataTable.Columns.Add("ClientAppUsed", typeof(string));
+            dataTable.Columns.Add("DeviceDetail", typeof(string));
+            dataTable.Columns.Add("IpAddress", typeof(string));
+            dataTable.Columns.Add("Location", typeof(string));
+            dataTable.Columns.Add("Status", typeof(string));
+            dataTable.Columns.Add("ErrorCode", typeof(int));
+            dataTable.Columns.Add("RiskLevel", typeof(string));
+            dataTable.Columns.Add("RiskState", typeof(string));
+            dataTable.Columns.Add("ConditionalAccessStatus", typeof(string));
+            dataTable.Columns.Add("IsInteractive", typeof(bool));
+            dataTable.Columns.Add("ResourceDisplayName", typeof(string));
+            dataTable.Columns.Add("ResourceId", typeof(string));
+
+            foreach (var log in logs)
+            {
+                dataTable.Rows.Add(
+                    log.ObjectId,
+                    log.SourceConnectionId,
+                    (object?)log.SignInId ?? DBNull.Value,
+                    log.SignInDateTime,
+                    (object?)log.AppDisplayName ?? DBNull.Value,
+                    (object?)log.AppId ?? DBNull.Value,
+                    (object?)log.ClientAppUsed ?? DBNull.Value,
+                    (object?)log.DeviceDetail ?? DBNull.Value,
+                    (object?)log.IpAddress ?? DBNull.Value,
+                    (object?)log.Location ?? DBNull.Value,
+                    (object?)log.Status ?? DBNull.Value,
+                    (object?)log.ErrorCode ?? DBNull.Value,
+                    (object?)log.RiskLevel ?? DBNull.Value,
+                    (object?)log.RiskState ?? DBNull.Value,
+                    (object?)log.ConditionalAccessStatus ?? DBNull.Value,
+                    log.IsInteractive,
+                    (object?)log.ResourceDisplayName ?? DBNull.Value,
+                    (object?)log.ResourceId ?? DBNull.Value);
+            }
+
+            using (var bulkCopy = new SqlBulkCopy(connection))
+            {
+                bulkCopy.DestinationTableName = "#TempSignInLogs";
+                bulkCopy.BulkCopyTimeout = 120;
+                foreach (DataColumn col in dataTable.Columns)
+                {
+                    bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                }
+                await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
+            }
+
+            _logger.LogInformation("Bulk copied {Count} sign-in logs to temp table", logs.Count);
+
+            // Sign-in events are immutable: INSERT new ones only, keyed on SignInId, so
+            // re-ingesting the same batch is a no-op (idempotency on re-ingest).
+            var affected = await connection.ExecuteScalarAsync<int>(@"
+                DECLARE @Affected INT = 0;
+
+                MERGE SignInLogs AS target
+                USING #TempSignInLogs AS source
+                ON (target.SignInId = source.SignInId)
+                WHEN NOT MATCHED THEN
+                    INSERT (Id, ObjectId, SourceConnectionId, SignInId, SignInDateTime, AppDisplayName, AppId, ClientAppUsed, DeviceDetail, IpAddress, Location, Status, ErrorCode, RiskLevel, RiskState, ConditionalAccessStatus, IsInteractive, ResourceDisplayName, ResourceId, CreatedAt)
+                    VALUES (NEWID(), source.ObjectId, source.SourceConnectionId, source.SignInId, source.SignInDateTime, source.AppDisplayName, source.AppId, source.ClientAppUsed, source.DeviceDetail, source.IpAddress, source.Location, source.Status, source.ErrorCode, source.RiskLevel, source.RiskState, source.ConditionalAccessStatus, source.IsInteractive, source.ResourceDisplayName, source.ResourceId, GETUTCDATE());
+
+                SET @Affected = @@ROWCOUNT;
+
+                DROP TABLE #TempSignInLogs;
+
+                SELECT @Affected;
+            ", commandTimeout: 120);
+
+            _logger.LogInformation("Bulk inserted {Count} sign-in logs ({Affected} affected)",
+                logs.Count, affected);
+
+            return affected;
+        }
+        finally
+        {
+            _sqlBulkCopySemaphore.Release();
+            _logger.LogMethodExit(nameof(BulkInsertSignInLogsAsync));
         }
     }
 

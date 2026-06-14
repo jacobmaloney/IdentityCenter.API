@@ -86,6 +86,9 @@ public class SyncRepositoryFacade : ISyncRepository
     public Task<Dictionary<string, Guid>> GetObjectIdsByDistinguishedNamesAsync(Guid sourceConnectionId, List<string> distinguishedNames, CancellationToken cancellationToken = default)
         => _objectRepo.GetObjectIdsByDistinguishedNamesAsync(sourceConnectionId, distinguishedNames, cancellationToken);
 
+    public Task<Dictionary<string, Guid>> GetObjectIdsByUserPrincipalNamesAsync(Guid sourceConnectionId, List<string> userPrincipalNames, CancellationToken cancellationToken = default)
+        => _objectRepo.GetObjectIdsByUserPrincipalNamesAsync(sourceConnectionId, userPrincipalNames, cancellationToken);
+
     public Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(Guid sourceConnectionId, CancellationToken cancellationToken = default)
         => _objectRepo.GetAllUnmatchedUserObjectsAsync(sourceConnectionId, cancellationToken);
 
@@ -94,6 +97,9 @@ public class SyncRepositoryFacade : ISyncRepository
 
     public Task<int> BulkUpsertObjectGroupMembershipsAsync(List<(Guid ObjectId, Guid GroupId, bool IsDirect, bool IsPrimary)> memberships, CancellationToken cancellationToken = default)
         => _objectRepo.BulkUpsertObjectGroupMembershipsAsync(memberships, cancellationToken);
+
+    public Task<int> BulkInsertSignInLogsAsync(List<SignInLog> logs, CancellationToken cancellationToken = default)
+        => _objectRepo.BulkInsertSignInLogsAsync(logs, cancellationToken);
 
     public Task<int> MarkRemovedObjectGroupMembershipsAsync(Guid objectId, List<Guid> currentGroupIds, CancellationToken cancellationToken = default)
         => _objectRepo.MarkRemovedObjectGroupMembershipsAsync(objectId, currentGroupIds, cancellationToken);
