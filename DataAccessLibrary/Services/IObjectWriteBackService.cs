@@ -119,6 +119,91 @@ public interface IObjectWriteBackService
         string source,
         WriteBackCallerContext? caller = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Phase D increment 2: route an Active-Directory write to the originating job server
+    /// (Conduit agent) over the existing HTTP agent-command channel (Option B). The agent
+    /// performs the LDAP mutation; IC never holds AD credentials. Enqueues an
+    /// "ApplyObjectWrite" AgentCommand and returns immediately with Status="Pending" — the
+    /// UI polls <see cref="GetAgentWriteStatusAsync"/> for the result.
+    /// </summary>
+    Task<AgentWriteDispatchResult> ApplyAdWriteViaAgentAsync(
+        Guid objectId,
+        AdAgentWriteRequest request,
+        WriteBackCallerContext caller,
+        string? stepUpToken = null);
+
+    /// <summary>
+    /// Read the current status of an agent-routed AD write by its command id. The UI polls
+    /// this until it transitions to Completed/Failed. The agent's ResultMessage is returned
+    /// verbatim and MUST be treated as untrusted (encode before rendering).
+    /// </summary>
+    Task<AgentWriteDispatchResult> GetAgentWriteStatusAsync(Guid commandId);
+}
+
+/// <summary>
+/// The AD operations the agent-routed write path supports. Names match the payload contract
+/// the consuming Conduit agent obeys exactly — do not rename without updating both sides.
+/// </summary>
+public enum AdAgentWriteOperation
+{
+    SetAttributes,
+    Enable,
+    Disable,
+    SetManager,
+    AddGroupMember,
+    RemoveGroupMember
+}
+
+/// <summary>
+/// A client-shaped AD write request. Carries ONLY the operation and its data — never the
+/// target agent, connection, or DN, which the coordinator resolves server-side from the
+/// object's own provenance. <see cref="Attributes"/> applies to SetAttributes/SetManager;
+/// <see cref="MemberObjectGuid"/> applies to Add/RemoveGroupMember.
+/// </summary>
+public sealed class AdAgentWriteRequest
+{
+    public AdAgentWriteOperation Operation { get; init; }
+
+    /// <summary>adAttribute -> value (null clears). For SetManager use key "manager" (DN value).</summary>
+    public Dictionary<string, string?> Attributes { get; init; } = new();
+
+    /// <summary>objectGUID of the member being added/removed (Add/RemoveGroupMember only).</summary>
+    public string? MemberObjectGuid { get; init; }
+
+    /// <summary>
+    /// Display name of the member, for the audit row only — never placed in the payload.
+    /// </summary>
+    public string? MemberDisplayName { get; init; }
+}
+
+/// <summary>
+/// Result of dispatching (or reading the status of) an agent-routed AD write. The write is
+/// asynchronous: a successful dispatch returns Status="Pending" with the command id; the
+/// terminal state ("Completed"/"Failed") and the agent message arrive on a later poll.
+/// </summary>
+public sealed class AgentWriteDispatchResult
+{
+    public bool Dispatched { get; init; }
+    public Guid? CommandId { get; init; }
+
+    /// <summary>"Pending" | "Acked" | "Completed" | "Failed" | "Denied" | "Error".</summary>
+    public string Status { get; init; } = "Pending";
+
+    /// <summary>Set once the command reaches a terminal state (null while in flight).</summary>
+    public bool? Success { get; init; }
+
+    /// <summary>Agent result message (UNTRUSTED) or a local denial/error reason.</summary>
+    public string? Message { get; init; }
+
+    public static AgentWriteDispatchResult Denied(string reason) =>
+        new() { Dispatched = false, Status = "Denied", Success = false, Message = reason };
+
+    public static AgentWriteDispatchResult Error(string reason) =>
+        new() { Dispatched = false, Status = "Error", Success = false, Message = reason };
+
+    public static AgentWriteDispatchResult Pending(Guid commandId) =>
+        new() { Dispatched = true, CommandId = commandId, Status = "Pending" };
 }
 
 /// <summary>

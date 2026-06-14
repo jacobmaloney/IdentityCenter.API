@@ -1,0 +1,361 @@
+/* ============================================================================
+   IdentityCenter API — Admin UI shell
+   Builds on the design tokens / dark theme copied from the IdentityCenter
+   WebPortal (design-tokens.css, dark-theme.css, components.css). Only the
+   admin-shell-specific pieces live here; everything visual inherits IC's look.
+   ========================================================================== */
+
+.admin-shell {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+.admin-topbar {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 10px 20px;
+    background: var(--color-surface-card, rgba(15, 23, 42, 0.85));
+    border-bottom: 1px solid var(--color-border-strong, #1e293b);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: none; /* never backdrop-filter a container with fixed children */
+}
+
+.admin-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 1.05rem;
+    color: var(--color-text-primary, #e2e8f0);
+    white-space: nowrap;
+}
+
+.admin-nav {
+    display: flex;
+    gap: 6px;
+    flex: 1;
+}
+
+.admin-nav-link {
+    padding: 6px 14px;
+    border-radius: 8px;
+    color: var(--color-text-secondary, #94a3b8);
+    text-decoration: none;
+    font-size: 0.92rem;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.admin-nav-link:hover {
+    color: var(--color-text-primary, #e2e8f0);
+    background: rgba(148, 163, 184, 0.08);
+}
+
+.admin-nav-link.active {
+    color: var(--color-primary, #00bcd4);
+    background: rgba(0, 188, 212, 0.1);
+}
+
+.admin-user {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.admin-user-name {
+    color: var(--color-text-secondary, #94a3b8);
+    font-size: 0.88rem;
+}
+
+.admin-logout-form {
+    margin: 0;
+}
+
+.admin-logout-btn {
+    background: transparent;
+    border: 1px solid var(--color-border-strong, #334155);
+    color: var(--color-text-secondary, #94a3b8);
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.admin-logout-btn:hover {
+    border-color: var(--color-primary, #00bcd4);
+    color: var(--color-primary, #00bcd4);
+}
+
+/* ── Page scaffolding ───────────────────────────────────────────────────── */
+.admin-main {
+    flex: 1;
+    padding: 24px;
+    max-width: 1400px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+.admin-page-header h1 {
+    font-size: 1.5rem;
+    margin: 0 0 4px 0;
+    color: var(--color-text-primary, #e2e8f0);
+}
+
+.admin-page-header p {
+    color: var(--color-text-secondary, #94a3b8);
+    font-size: 0.9rem;
+    margin: 0 0 20px 0;
+}
+
+.admin-card {
+    background: var(--color-surface-card, rgba(15, 23, 42, 0.7));
+    border: 1px solid var(--color-border-strong, #1e293b);
+    border-radius: 12px;
+    margin-bottom: 20px;
+    overflow: hidden;
+}
+
+.admin-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--color-border-strong, #1e293b);
+}
+
+.admin-card-header h2 {
+    font-size: 1.02rem;
+    margin: 0;
+    color: var(--color-text-primary, #e2e8f0);
+}
+
+.admin-card-body {
+    padding: 16px 18px;
+}
+
+.admin-card-link {
+    color: var(--color-primary, #00bcd4);
+    text-decoration: none;
+    font-size: 0.88rem;
+}
+
+/* ── Stat cards ─────────────────────────────────────────────────────────── */
+.admin-stat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+}
+
+.admin-stat-card {
+    background: var(--color-surface-card, rgba(15, 23, 42, 0.7));
+    border: 1px solid var(--color-border-strong, #1e293b);
+    border-radius: 12px;
+    padding: 16px 18px;
+}
+
+.admin-stat-value {
+    font-size: 1.7rem;
+    font-weight: 600;
+    color: var(--color-text-primary, #e2e8f0);
+    line-height: 1.2;
+}
+
+.admin-stat-value.warn { color: #fbbf24; }
+.admin-stat-value.danger { color: #f87171; }
+
+.admin-stat-unit {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary, #94a3b8);
+    margin-left: 3px;
+}
+
+.admin-stat-label {
+    color: var(--color-text-secondary, #94a3b8);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+}
+
+/* ── Chart ──────────────────────────────────────────────────────────────── */
+.admin-chart {
+    width: 100%;
+    height: 300px;
+    display: block;
+}
+
+.admin-chart-grid {
+    stroke: rgba(148, 163, 184, 0.12);
+    stroke-width: 1;
+}
+
+.admin-chart-axisline {
+    stroke: rgba(148, 163, 184, 0.35);
+    stroke-width: 1;
+}
+
+.admin-chart-axis {
+    fill: var(--color-text-secondary, #94a3b8);
+    font-size: 11px;
+    font-family: var(--font-mono, 'Cascadia Code', Consolas, monospace);
+}
+
+.admin-chart-empty {
+    color: var(--color-text-secondary, #94a3b8);
+    text-align: center;
+    padding: 40px 0;
+    font-size: 0.92rem;
+}
+
+.admin-chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-top: 12px;
+}
+
+.admin-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--color-text-primary, #e2e8f0);
+    font-size: 0.85rem;
+    font-family: var(--font-mono, 'Cascadia Code', Consolas, monospace);
+}
+
+.admin-legend-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    display: inline-block;
+}
+
+.admin-legend-total {
+    color: var(--color-text-secondary, #94a3b8);
+}
+
+.admin-window-picker {
+    display: flex;
+    gap: 6px;
+}
+
+.admin-window-btn {
+    background: transparent;
+    border: 1px solid var(--color-border-strong, #334155);
+    color: var(--color-text-secondary, #94a3b8);
+    border-radius: 8px;
+    padding: 4px 12px;
+    font-size: 0.82rem;
+    cursor: pointer;
+}
+
+.admin-window-btn.active {
+    border-color: var(--color-primary, #00bcd4);
+    color: var(--color-primary, #00bcd4);
+    background: rgba(0, 188, 212, 0.08);
+}
+
+/* ── Log viewer ─────────────────────────────────────────────────────────── */
+.admin-log-toolbar {
+    flex-wrap: wrap;
+}
+
+.admin-log-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.admin-select,
+.admin-search {
+    background: rgba(2, 6, 23, 0.6);
+    border: 1px solid var(--color-border-strong, #334155);
+    color: var(--color-text-primary, #e2e8f0);
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 0.85rem;
+}
+
+.admin-search {
+    min-width: 220px;
+}
+
+.admin-search:focus,
+.admin-select:focus {
+    outline: none;
+    border-color: var(--color-primary, #00bcd4);
+}
+
+.admin-log-count {
+    color: var(--color-text-secondary, #94a3b8);
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+
+.admin-log-list {
+    font-family: var(--font-mono, 'Cascadia Code', Consolas, monospace);
+    font-size: 0.82rem;
+}
+
+.admin-log-console {
+    max-height: 65vh;
+    overflow-y: auto;
+}
+
+.admin-log-row {
+    display: flex;
+    gap: 10px;
+    padding: 3px 4px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+    align-items: baseline;
+}
+
+.admin-log-row:hover {
+    background: rgba(148, 163, 184, 0.05);
+}
+
+.admin-log-time {
+    color: var(--color-text-secondary, #64748b);
+    white-space: nowrap;
+}
+
+.admin-log-level {
+    font-weight: 700;
+    color: var(--color-text-secondary, #94a3b8);
+    white-space: nowrap;
+}
+
+.admin-log-level.warning { color: #fbbf24; }
+.admin-log-level.error { color: #f87171; }
+.admin-log-level.fatal { color: #f87171; text-decoration: underline; }
+.admin-log-level.debug { color: #64748b; }
+
+.admin-log-source {
+    color: #38bdf8;
+    white-space: nowrap;
+}
+
+.admin-log-message {
+    color: var(--color-text-primary, #cbd5e1);
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.admin-log-exception {
+    color: #fca5a5;
+    background: rgba(248, 113, 113, 0.06);
+    border-left: 3px solid #f87171;
+    margin: 2px 0 6px 24px;
+    padding: 8px 12px;
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}

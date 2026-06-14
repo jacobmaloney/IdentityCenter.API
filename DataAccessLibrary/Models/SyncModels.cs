@@ -418,6 +418,13 @@ namespace DataAccessLibrary.Models
         public string? OriginalSource { get; set; }
 
         /// <summary>
+        /// Provenance: the Agents(Id) of the job server (Conduit installation) that last
+        /// wrote this row (V143). Soft reference, no FK. NULL until a sync re-stamps it.
+        /// Used by the agent-routed write-back path to address the originating agent.
+        /// </summary>
+        public Guid? SourceJobServerId { get; set; }
+
+        /// <summary>
         /// Object class type: User, Computer, Group, Contact, OrganizationalUnit, etc.
         /// Determines how the object is displayed and categorized in the UI
         /// </summary>

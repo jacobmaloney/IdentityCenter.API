@@ -16,7 +16,14 @@ public enum WriteCapability
     CreateUser,
     CreateGroup,
     InviteGuest,
-    CreateEnterpriseApp
+    CreateEnterpriseApp,
+
+    /// <summary>
+    /// Override required to add/remove members on privileged, role-assignable groups
+    /// (Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators).
+    /// Read-only by default and checked IN ADDITION to <see cref="ManageMembership"/>.
+    /// </summary>
+    ManagePrivilegedGroups
 }
 
 /// <summary>

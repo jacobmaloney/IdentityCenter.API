@@ -1,0 +1,687 @@
+/**
+ * DEEP OBSIDIAN DARK THEME
+ * Complete dark theme foundation for IdentityCenter
+ *
+ * Provides:
+ * - Dark base styling (html, body)
+ * - CSS-only geometric mesh background
+ * - Glassmorphism utility classes
+ * - Bootstrap 5 dark overrides
+ * - Dark scrollbar styling
+ * - Selection highlight
+ */
+
+/* ==========================================================================
+   BASE DARK STYLING
+   ========================================================================== */
+
+:root {
+    --bs-body-bg: var(--color-background);
+    --bs-body-color: var(--color-text-primary);
+}
+
+html, body {
+    background-color: var(--color-background) !important;
+    color: var(--color-text-primary);
+}
+
+/* ==========================================================================
+   CSS-ONLY GEOMETRIC MESH BACKGROUND
+   Diagonal grid lines + radial nodes using CSS gradients
+   ========================================================================== */
+
+body {
+    background-color: var(--color-background);
+    background-image:
+        /* Diagonal lines (top-left to bottom-right) */
+        repeating-linear-gradient(
+            45deg,
+            transparent,
+            transparent 60px,
+            rgba(0, 188, 212, 0.03) 60px,
+            rgba(0, 188, 212, 0.03) 61px
+        ),
+        /* Diagonal lines (top-right to bottom-left) */
+        repeating-linear-gradient(
+            -45deg,
+            transparent,
+            transparent 60px,
+            rgba(0, 188, 212, 0.03) 60px,
+            rgba(0, 188, 212, 0.03) 61px
+        ),
+        /* Radial node dots at intersections */
+        radial-gradient(circle 1.5px at 50% 50%, rgba(0, 188, 212, 0.08) 0%, transparent 100%),
+        /* Subtle ambient glow top-left */
+        radial-gradient(ellipse at 20% 10%, rgba(0, 188, 212, 0.04) 0%, transparent 60%),
+        /* Subtle ambient glow bottom-right */
+        radial-gradient(ellipse at 80% 90%, rgba(0, 188, 212, 0.03) 0%, transparent 60%);
+    background-size:
+        85px 85px,
+        85px 85px,
+        85px 85px,
+        100% 100%,
+        100% 100%;
+    background-attachment: fixed;
+}
+
+/* ==========================================================================
+   GLASSMORPHISM UTILITY CLASSES
+   ========================================================================== */
+
+.glass {
+    background: var(--color-surface-card);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--color-border-strong);
+}
+
+.glass-card {
+    background: var(--color-surface-card);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3), 0 0 15px rgba(0, 188, 212, 0.08), 0 0 0 1px rgba(0, 188, 212, 0.05);
+}
+
+.glass-card-bright {
+    background: rgba(22, 33, 56, 0.8);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--color-primary-200);
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3), 0 0 20px rgba(0, 188, 212, 0.12), 0 0 0 1px rgba(0, 188, 212, 0.1);
+}
+
+.glass-surface {
+    background: rgba(22, 33, 56, 0.6);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+.glass-border {
+    border: 1px solid var(--color-border-strong);
+}
+
+.glass-border-glow {
+    border: 1px solid rgba(0, 188, 212, 0.25);
+    box-shadow: 0 0 20px rgba(0, 188, 212, 0.1), inset 0 0 12px rgba(0, 188, 212, 0.04);
+}
+
+/* ==========================================================================
+   BOOTSTRAP 5 DARK OVERRIDES
+   ========================================================================== */
+
+/* --- Forms --- */
+.form-control,
+.form-select {
+    background-color: var(--color-gray-50) !important;
+    border-color: var(--color-border);
+    color: var(--color-text-primary) !important;
+}
+
+.form-control:focus,
+.form-select:focus {
+    background-color: var(--color-gray-50) !important;
+    border-color: var(--color-primary);
+    color: var(--color-text-primary) !important;
+    box-shadow: 0 0 0 3px rgba(0, 188, 212, 0.2);
+}
+
+.form-control::placeholder {
+    color: var(--color-text-tertiary);
+}
+
+/* Select option elements - browsers use OS native rendering, force dark */
+.form-select option,
+select option {
+    background-color: var(--color-gray-50);
+    color: var(--color-text-primary);
+}
+
+.form-floating > label {
+    color: var(--color-text-secondary);
+}
+
+.form-floating > .form-control:focus ~ label,
+.form-floating > .form-control:not(:placeholder-shown) ~ label,
+.form-floating > .form-select ~ label {
+    color: var(--color-primary);
+}
+
+.form-check-input {
+    background-color: var(--color-surface-inset);
+    border-color: var(--color-primary-200);
+}
+
+.form-check-input:checked {
+    background-color: var(--color-primary);
+    border-color: var(--color-primary);
+}
+
+.form-check-input:focus {
+    box-shadow: 0 0 0 3px rgba(0, 188, 212, 0.2);
+}
+
+.input-group-text {
+    background-color: rgba(15, 23, 42, 0.6);
+    border-color: var(--color-border);
+    color: var(--color-text-secondary);
+}
+
+/* --- Tables --- */
+html:not(.light-theme) .table {
+    --bs-table-bg: transparent;
+    --bs-table-color: var(--color-text-primary);
+    --bs-table-border-color: var(--color-border-default);
+    --bs-table-striped-bg: var(--color-primary-50);
+    --bs-table-striped-color: var(--color-text-primary);
+    --bs-table-hover-bg: rgba(0, 188, 212, 0.06);
+    --bs-table-hover-color: var(--color-text-primary);
+    color: var(--color-text-primary);
+    border-color: var(--color-border-subtle);
+}
+
+html:not(.light-theme) .table > thead {
+    background: rgba(30, 58, 95, 0.9);
+    border-bottom: 2px solid rgba(59, 130, 246, 0.3);
+}
+
+html:not(.light-theme) .table > thead th {
+    color: #ffffff;
+    border-bottom-color: rgba(59, 130, 246, 0.2);
+    font-weight: 700;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding-top: 0.75rem;
+    padding-bottom: 0.75rem;
+}
+
+html:not(.light-theme) .table > tbody > tr > td {
+    border-bottom-color: var(--color-border-subtle);
+}
+
+html:not(.light-theme) .table-striped > tbody > tr:nth-of-type(odd) > * {
+    background-color: var(--color-primary-50);
+    color: var(--color-text-primary);
+}
+
+html:not(.light-theme) .table > tbody > tr.table-active > td,
+html:not(.light-theme) .table > tbody > tr.table-active > th {
+    --bs-table-active-bg: var(--color-primary-100);
+    --bs-table-active-color: var(--color-text-primary);
+    background-color: var(--color-primary-100);
+    color: var(--color-text-primary);
+}
+
+/* --- Cards --- */
+.card {
+    background: var(--color-surface-card);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-color: var(--color-border);
+    color: var(--color-text-primary);
+}
+
+.card-header {
+    background: rgba(22, 33, 56, 0.5);
+    border-bottom-color: var(--color-border-subtle);
+    color: var(--color-text-primary);
+}
+
+.card-footer {
+    background: rgba(22, 33, 56, 0.5);
+    border-top-color: var(--color-border-subtle);
+}
+
+/* --- List Groups --- */
+.list-group-item {
+    background-color: rgba(22, 33, 56, 0.6);
+    border-color: var(--color-border-default);
+    color: var(--color-text-primary);
+}
+
+.list-group-item:hover {
+    background-color: var(--color-primary-50);
+}
+
+.list-group-item.active {
+    background-color: var(--color-primary-light);
+    border-color: var(--color-primary-200);
+    color: var(--color-text-primary);
+}
+
+.list-group-item.active .text-muted {
+    color: rgba(148, 163, 184, 0.9) !important;
+}
+
+/* --- Modals --- */
+/* NOTE: Do NOT add backdrop-filter here - it creates a containing block
+   that breaks position:fixed on nested modals (e.g. SyncProjectWizard fullscreen) */
+.modal-content {
+    background: rgba(22, 33, 56, 0.98);
+    border: 1px solid var(--color-border-strong);
+    color: var(--color-text-primary);
+    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5), 0 0 20px rgba(0, 188, 212, 0.08);
+}
+
+.modal-header {
+    border-bottom-color: var(--color-border-subtle);
+}
+
+.modal-header .btn-close {
+    filter: var(--btn-close-filter);
+}
+
+.modal-footer {
+    border-top-color: var(--color-border-subtle);
+}
+
+.modal-backdrop {
+    background-color: var(--color-bg-overlay);
+}
+
+/* --- Dropdowns --- */
+.dropdown-menu {
+    background-color: rgba(22, 33, 56, 0.95);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--color-border);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.dropdown-item {
+    color: var(--color-text-primary);
+}
+
+.dropdown-item:hover,
+.dropdown-item:focus {
+    background-color: var(--color-primary-50);
+    color: var(--color-text-link-hover);
+}
+
+.dropdown-divider {
+    border-top-color: var(--color-border-subtle);
+}
+
+/* --- FieldLookup dropdown (inline <style> defaults to light) --- */
+.field-lookup-dropdown {
+    background: var(--color-gray-50) !important;
+    border-color: rgba(0, 188, 212, 0.25) !important;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
+}
+
+.field-lookup-dropdown .dropdown-item {
+    color: var(--color-text-primary);
+    border-bottom-color: var(--color-border-subtle);
+}
+
+.field-lookup-dropdown .dropdown-item:hover:not(.disabled) {
+    background-color: var(--color-primary-50);
+    color: var(--color-text-link-hover);
+}
+
+/* --- Accordions --- */
+.accordion-item {
+    background-color: var(--color-surface-card);
+    border-color: var(--color-border-subtle);
+}
+
+.accordion-button {
+    background-color: rgba(22, 33, 56, 0.6);
+    color: var(--color-text-primary);
+}
+
+.accordion-button:not(.collapsed) {
+    background-color: var(--color-primary-50);
+    color: var(--color-primary);
+    box-shadow: inset 0 -1px 0 var(--color-border-subtle);
+}
+
+.accordion-button::after {
+    filter: invert(1) brightness(200%);
+}
+
+.accordion-body {
+    background-color: rgba(22, 33, 56, 0.5);
+}
+
+/* --- Pagination --- */
+.page-link {
+    background-color: rgba(22, 33, 56, 0.6);
+    border-color: var(--color-border-default);
+    color: var(--color-text-secondary);
+}
+
+.page-link:hover {
+    background-color: var(--color-primary-100);
+    border-color: var(--color-border-strong);
+    color: var(--color-primary);
+}
+
+.page-item.active .page-link {
+    background-color: var(--color-primary);
+    border-color: var(--color-primary);
+    color: var(--color-background);
+}
+
+.page-item.disabled .page-link {
+    background-color: rgba(22, 33, 56, 0.3);
+    border-color: var(--color-border-subtle);
+    color: var(--color-text-disabled);
+}
+
+/* --- Alerts --- */
+.alert {
+    border-width: 1px;
+}
+
+.alert-primary {
+    background-color: var(--color-primary-100);
+    border-color: var(--color-primary-200);
+    color: var(--color-info-300);
+}
+
+.alert-success {
+    background-color: var(--color-success-light);
+    border-color: rgba(34, 197, 94, 0.2);
+    color: var(--color-success-300);
+}
+
+.alert-warning {
+    background-color: var(--color-warning-light);
+    border-color: rgba(245, 158, 11, 0.2);
+    color: var(--color-warning-300);
+}
+
+.alert-danger {
+    background-color: var(--color-danger-light);
+    border-color: rgba(239, 68, 68, 0.2);
+    color: var(--color-danger-300);
+}
+
+.alert-info {
+    background-color: var(--color-info-light);
+    border-color: rgba(6, 182, 212, 0.2);
+    color: var(--color-info-300);
+}
+
+/* --- Nav Tabs / Pills --- */
+.nav-tabs {
+    border-bottom-color: var(--color-border-default);
+}
+
+.nav-tabs .nav-link {
+    color: var(--color-text-secondary);
+}
+
+.nav-tabs .nav-link:hover {
+    border-color: var(--color-border-strong);
+    color: var(--color-primary);
+}
+
+.nav-tabs .nav-link.active {
+    background-color: var(--color-surface-card);
+    border-color: var(--color-border);
+    border-bottom-color: transparent;
+    color: var(--color-primary);
+}
+
+.nav-pills .nav-link {
+    color: var(--color-text-secondary);
+}
+
+.nav-pills .nav-link.active {
+    background-color: var(--color-primary);
+    color: var(--color-background);
+}
+
+/* --- Breadcrumbs --- */
+.breadcrumb {
+    background-color: rgba(22, 33, 56, 0.5);
+}
+
+.breadcrumb-item a {
+    color: var(--color-text-link);
+}
+
+.breadcrumb-item.active {
+    color: var(--color-text-secondary);
+}
+
+.breadcrumb-item + .breadcrumb-item::before {
+    color: var(--color-text-disabled);
+}
+
+/* --- Progress Bars --- */
+.progress {
+    background-color: var(--color-surface-inset);
+}
+
+/* --- Toasts --- */
+.toast {
+    background-color: rgba(22, 33, 56, 0.95);
+    border-color: var(--color-border);
+    color: var(--color-text-primary);
+}
+
+.toast-header {
+    background-color: rgba(22, 33, 56, 0.8);
+    border-bottom-color: var(--color-border-subtle);
+    color: var(--color-text-primary);
+}
+
+.toast-header .btn-close {
+    filter: var(--btn-close-filter);
+}
+
+/* --- Close Button --- */
+.btn-close {
+    filter: var(--btn-close-filter);
+}
+
+/* ==========================================================================
+   BOOTSTRAP UTILITY OVERRIDES
+   Override .bg-light, .bg-white, .text-muted, .text-dark, .border-*
+   ========================================================================== */
+
+.bg-light {
+    background-color: var(--color-surface-inset) !important;
+}
+
+.bg-white {
+    background-color: var(--color-surface-card) !important;
+}
+
+.text-muted {
+    color: var(--color-text-secondary) !important;
+}
+
+.card-header .text-muted,
+.card-header small {
+    color: rgba(255, 255, 255, 0.7) !important;
+}
+
+.text-dark {
+    color: var(--color-text-primary) !important;
+}
+
+.text-body {
+    color: var(--color-text-primary) !important;
+}
+
+.border {
+    border-color: var(--color-border-default) !important;
+}
+
+.border-top {
+    border-top-color: var(--color-border-default) !important;
+}
+
+.border-bottom {
+    border-bottom-color: var(--color-border-default) !important;
+}
+
+.border-start {
+    border-left-color: var(--color-border-default) !important;
+}
+
+.border-end {
+    border-right-color: var(--color-border-default) !important;
+}
+
+/* ==========================================================================
+   DARK SCROLLBAR STYLING
+   ========================================================================== */
+
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(10, 14, 26, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--color-primary-200);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 188, 212, 0.35);
+}
+
+/* Firefox scrollbar */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-primary-200) rgba(10, 14, 26, 0.5);
+}
+
+/* ==========================================================================
+   SELECTION HIGHLIGHT
+   ========================================================================== */
+
+::selection {
+    background: rgba(0, 188, 212, 0.3);
+    color: var(--color-text-primary);
+}
+
+::-moz-selection {
+    background: rgba(0, 188, 212, 0.3);
+    color: var(--color-text-primary);
+}
+
+/* ==========================================================================
+   BLAZOR ERROR UI - Dark Override
+   ========================================================================== */
+
+#blazor-error-ui {
+    background: rgba(22, 33, 56, 0.95);
+    border-top: 2px solid var(--color-primary);
+    color: var(--color-text-primary);
+}
+
+/* ==========================================================================
+   MISC DARK OVERRIDES
+   ========================================================================== */
+
+/* hr elements */
+hr {
+    border-color: var(--color-border-subtle);
+    opacity: 1;
+}
+
+/* Code blocks */
+code {
+    color: var(--color-info-300);
+    background-color: var(--color-primary-100);
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.25rem;
+}
+
+pre {
+    background-color: var(--color-surface-inset);
+    border: 1px solid var(--color-border-default);
+    border-radius: 0.375rem;
+    color: var(--color-text-primary);
+}
+
+pre code {
+    background-color: transparent;
+    padding: 0;
+}
+
+/* Popover */
+.popover {
+    background-color: rgba(22, 33, 56, 0.95);
+    border-color: var(--color-border);
+}
+
+.popover-header {
+    background-color: rgba(22, 33, 56, 0.8);
+    border-bottom-color: var(--color-border-subtle);
+    color: var(--color-text-primary);
+}
+
+.popover-body {
+    color: var(--color-text-primary);
+}
+
+/* Tooltip */
+.tooltip-inner {
+    background-color: rgba(22, 33, 56, 0.95);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-primary);
+}
+
+/* Offcanvas */
+.offcanvas {
+    background-color: rgba(22, 33, 56, 0.95);
+    color: var(--color-text-primary);
+}
+
+/* Badge override for dark theme contrast */
+.badge.bg-light {
+    background-color: var(--color-primary-100) !important;
+    color: var(--color-primary) !important;
+}
+
+.badge.bg-secondary {
+    background-color: rgba(148, 163, 184, 0.15) !important;
+    color: var(--color-text-secondary) !important;
+}
+
+/* View Person Record button */
+.view-person-btn {
+    transition: all 0.2s ease;
+}
+.view-person-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 15px rgba(25, 135, 84, 0.5);
+    filter: brightness(1.2);
+}
+
+/* Table headers — ensure contrast in dark mode */
+.table thead th,
+.table > thead > tr > th,
+.quickgrid thead th {
+    background-color: rgba(30, 41, 59, 0.8) !important;
+    color: var(--color-gray-800) !important;
+    border-bottom-color: var(--color-border-strong) !important;
+}
+.table tbody td,
+.quickgrid tbody td {
+    color: var(--color-text-primary) !important;
+    border-bottom-color: rgba(255, 255, 255, 0.06) !important;
+}
+.table tbody tr:hover td {
+    background-color: var(--table-row-hover-bg) !important;
+}
+
+/* Footer override */
+footer.bg-light {
+    background-color: rgba(10, 14, 26, 0.8) !important;
+    border-top-color: var(--color-border-default) !important;
+}
