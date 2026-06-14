@@ -2248,6 +2248,51 @@ IF NOT EXISTS (SELECT 1 FROM Objects WHERE SourceConnectionId=@{p}_ConnId AND So
         }
     }
 
+    public async Task<Dictionary<string, Guid>> GetObjectIdsByDistinguishedNamesAsync(
+        Guid sourceConnectionId,
+        List<string> distinguishedNames,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogMethodEntry(nameof(GetObjectIdsByDistinguishedNamesAsync),
+            new { sourceConnectionId, count = distinguishedNames?.Count ?? 0 });
+
+        try
+        {
+            if (distinguishedNames == null || !distinguishedNames.Any())
+            {
+                return new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            var sql = @"
+                SELECT DN AS DistinguishedName, Id
+                FROM Objects
+                WHERE SourceConnectionId = @SourceConnectionId
+                  AND DN IN @DistinguishedNames
+            ";
+
+            var results = await connection.QueryAsync<(string DistinguishedName, Guid Id)>(sql,
+                new { SourceConnectionId = sourceConnectionId, DistinguishedNames = distinguishedNames },
+                commandTimeout: 120);
+
+            var map = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in results)
+            {
+                if (!string.IsNullOrWhiteSpace(r.DistinguishedName))
+                {
+                    map[r.DistinguishedName] = r.Id;
+                }
+            }
+            return map;
+        }
+        finally
+        {
+            _logger.LogMethodExit(nameof(GetObjectIdsByDistinguishedNamesAsync));
+        }
+    }
+
     public async Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(
         Guid sourceConnectionId,
         CancellationToken cancellationToken = default)

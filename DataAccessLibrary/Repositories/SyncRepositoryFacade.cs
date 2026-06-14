@@ -83,6 +83,9 @@ public class SyncRepositoryFacade : ISyncRepository
     public Task<Dictionary<string, Guid>> GetObjectIdsBySourceUniqueIdsAsync(Guid sourceConnectionId, List<string> sourceUniqueIds, CancellationToken cancellationToken = default)
         => _objectRepo.GetObjectIdsBySourceUniqueIdsAsync(sourceConnectionId, sourceUniqueIds, cancellationToken);
 
+    public Task<Dictionary<string, Guid>> GetObjectIdsByDistinguishedNamesAsync(Guid sourceConnectionId, List<string> distinguishedNames, CancellationToken cancellationToken = default)
+        => _objectRepo.GetObjectIdsByDistinguishedNamesAsync(sourceConnectionId, distinguishedNames, cancellationToken);
+
     public Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(Guid sourceConnectionId, CancellationToken cancellationToken = default)
         => _objectRepo.GetAllUnmatchedUserObjectsAsync(sourceConnectionId, cancellationToken);
 

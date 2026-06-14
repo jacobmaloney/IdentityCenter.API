@@ -61,6 +61,9 @@ public interface ISyncObjectRepository
     Task<Dictionary<string, Guid>> GetObjectIdsBySourceUniqueIdsAsync(
         Guid sourceConnectionId, List<string> sourceUniqueIds, CancellationToken cancellationToken = default);
 
+    Task<Dictionary<string, Guid>> GetObjectIdsByDistinguishedNamesAsync(
+        Guid sourceConnectionId, List<string> distinguishedNames, CancellationToken cancellationToken = default);
+
     Task<List<ObjectWithAttributes>> GetAllUnmatchedUserObjectsAsync(
         Guid sourceConnectionId, CancellationToken cancellationToken = default);
 

@@ -1123,6 +1123,24 @@ public class ObjectsController : ControllerBase
                 ? await _syncObjectRepository.GetObjectIdsBySourceUniqueIdsAsync(connectionId, memberIds)
                 : new Dictionary<string, Guid>();
 
+            // AD pushes group members as DNs (LDAP `member` is always DNs), which
+            // do not match Objects.SourceUniqueId (= objectGUID). For member ids
+            // that did NOT resolve as a SourceUniqueId, fall back to resolving them
+            // against Objects.DistinguishedName, connection-scoped. Applies to
+            // MEMBER ids only — group ids are objectGUIDs and resolve above.
+            var unresolvedMemberIds = memberIds
+                .Where(id => !memberMap.ContainsKey(id))
+                .ToList();
+            if (unresolvedMemberIds.Count > 0)
+            {
+                var dnMap = await _syncObjectRepository.GetObjectIdsByDistinguishedNamesAsync(connectionId, unresolvedMemberIds);
+                foreach (var kvp in dnMap)
+                {
+                    if (!memberMap.ContainsKey(kvp.Key))
+                        memberMap[kvp.Key] = kvp.Value;
+                }
+            }
+
             var edges = new List<(Guid ObjectId, Guid GroupId, bool IsDirect, bool IsPrimary)>();
             int groupsResolved = 0, groupsUnresolved = 0, membersResolved = 0, membersUnresolved = 0;
 
