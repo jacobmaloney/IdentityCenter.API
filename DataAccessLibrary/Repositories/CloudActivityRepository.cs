@@ -270,6 +270,19 @@ public class CloudActivityRepository : ICloudActivityRepository
         return count;
     }
 
+    public async Task<M365UsageReport?> GetLatestUsageReportForObjectAsync(Guid objectId, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT TOP 1 *
+            FROM M365UsageReports
+            WHERE ObjectId = @ObjectId
+            ORDER BY ReportRefreshDate DESC;";
+
+        using var conn = CreateConnection();
+        await conn.OpenAsync(ct);
+        return await conn.QueryFirstOrDefaultAsync<M365UsageReport>(sql, new { ObjectId = objectId });
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // App Role Assignments
     // ─────────────────────────────────────────────────────────────────────────

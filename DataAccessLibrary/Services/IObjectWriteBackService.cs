@@ -20,17 +20,30 @@ public interface IObjectWriteBackService
         Guid objectId,
         Dictionary<string, string?> fields,
         string source,
-        WriteBackCallerContext? caller = null);
+        WriteBackCallerContext? caller = null,
+        string? stepUpToken = null);
 
     /// <summary>
     /// Enable or disable an Object's account in both the database and the target directory.
     /// Handles UAC flag manipulation in AD.
     /// </summary>
+    /// <param name="stepUpToken">
+    /// When <paramref name="requireStepUp"/> is true, a server-issued single-use step-up token
+    /// bound to (caller, EnableDisable, objectId). Verified server-side before the write.
+    /// </param>
+    /// <param name="requireStepUp">
+    /// True for interactive surfaces that mandate step-up on enable/disable (e.g. the Entra Manage
+    /// pane). When true and the token is absent/invalid for a non-system caller, the write is
+    /// rejected and audited. Defaults false so existing remediation/automation callers are
+    /// unaffected.
+    /// </param>
     Task<WriteBackResult> SetObjectEnabledAsync(
         Guid objectId,
         bool enabled,
         string source,
-        WriteBackCallerContext? caller = null);
+        WriteBackCallerContext? caller = null,
+        string? stepUpToken = null,
+        bool requireStepUp = false);
 
     /// <summary>
     /// Update an Object's manager reference in both the database and the target directory.
@@ -64,6 +77,26 @@ public interface IObjectWriteBackService
         Guid licensePoolId,
         string source,
         WriteBackCallerContext? caller = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Replace the proxyAddresses multivalued attribute on an Entra ID user. The supplied list
+    /// is the COMPLETE desired set (add/remove/set-primary are expressed by the full target
+    /// list). Gated under <see cref="WriteCapability.EditAttributes"/>, validated server-side in
+    /// the connector (whole payload rejected on any malformed entry), and audited with before/
+    /// after. Interactive callers must pass a real <paramref name="caller"/> built from the
+    /// authenticated principal.
+    /// </summary>
+    /// <param name="stepUpToken">
+    /// Server-issued single-use step-up token bound to (caller, EditProxyAddresses, objectId).
+    /// proxyAddress edits are always step-up-required for non-system callers; verified server-side.
+    /// </param>
+    Task<WriteBackResult> UpdateProxyAddressesAsync(
+        Guid objectId,
+        IReadOnlyList<string> proxyAddresses,
+        string source,
+        WriteBackCallerContext? caller = null,
+        string? stepUpToken = null,
         CancellationToken ct = default);
 
     /// <summary>

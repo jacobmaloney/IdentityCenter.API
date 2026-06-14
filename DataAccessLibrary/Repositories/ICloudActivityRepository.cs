@@ -44,6 +44,12 @@ public interface ICloudActivityRepository
     /// </summary>
     Task<int> BulkUpsertUsageReportsAsync(IEnumerable<M365UsageReport> reports, CancellationToken ct = default);
 
+    /// <summary>
+    /// Returns the most recent M365 usage report row for a single object (by ReportRefreshDate),
+    /// or null if none exists. Used by the Entra Manage pane's OneDrive card.
+    /// </summary>
+    Task<M365UsageReport?> GetLatestUsageReportForObjectAsync(Guid objectId, CancellationToken ct = default);
+
     // ── App Role Assignments ────────────────────────────────────────────────
 
     /// <summary>
