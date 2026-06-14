@@ -304,6 +304,12 @@ public class ObjectsController : ControllerBase
             _logger.LogDebug("PERF: auto-seed-connections {Ms}ms ({Count} sources, batch {BatchId})",
                 msSeed, distinctSources.Count, request.BatchId);
 
+            // Resolve (auto-registering if absent) the job server that pushed this batch
+            // to its Agents row. The resulting id is stamped onto every object's
+            // SourceJobServerId in the set-based upsert below. Null for pre-Phase-C callers.
+            var jobServerId = await ResolveAndRegisterJobServerAsync(
+                conn, request.SourceJobServerId, request.SourceJobServerName);
+
             // Resolve a SourceConnectionId per Source string once for the batch.
             // Most batches share one source; this is just a small cache.
             var sourceToConnection = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
@@ -419,7 +425,7 @@ public class ObjectsController : ControllerBase
                 IReadOnlyList<MergeOutputRow> mergeOut;
                 try
                 {
-                    mergeOut = await UpsertObjectsSetBasedAsync(conn, prepared);
+                    mergeOut = await UpsertObjectsSetBasedAsync(conn, prepared, jobServerId);
                 }
                 catch (Exception mergeEx)
                 {
@@ -602,7 +608,7 @@ public class ObjectsController : ControllerBase
     /// per-item Created/Updated/Revived and resolve the ObjectId for the attribute flush.
     /// </summary>
     private async Task<IReadOnlyList<MergeOutputRow>> UpsertObjectsSetBasedAsync(
-        SqlConnection conn, List<PreparedObject> prepared)
+        SqlConnection conn, List<PreparedObject> prepared, Guid? jobServerId)
     {
         var swc = Stopwatch.StartNew();
         // ── Build the #StagingObjects temp table. Key + driver columns are fixed;
@@ -634,6 +640,7 @@ public class ObjectsController : ControllerBase
                 InsertLifecycleState INT NOT NULL,
                 HasExplicitIsActive BIT NOT NULL,
                 ExplicitIsActive BIT NOT NULL,
+                SourceJobServerId UNIQUEIDENTIFIER NULL,
                 {writableColDdl}
             );
             CREATE CLUSTERED INDEX IX_StagingObjects ON #StagingObjects (SourceConnectionId, SourceUniqueId);");
@@ -651,6 +658,7 @@ public class ObjectsController : ControllerBase
             table.Columns.Add("InsertLifecycleState", typeof(int));
             table.Columns.Add("HasExplicitIsActive", typeof(bool));
             table.Columns.Add("ExplicitIsActive", typeof(bool));
+            table.Columns.Add("SourceJobServerId", typeof(Guid));
             foreach (var c in WritableColumnList)
                 table.Columns.Add(c, typeof(string));
 
@@ -679,6 +687,12 @@ public class ObjectsController : ControllerBase
                 var insertIsActive = hasExplicit ? explicitVal : true;
                 row["InsertIsActive"] = insertIsActive;
                 row["InsertLifecycleState"] = insertIsActive ? 0 : 1;
+
+                // Job-server provenance: same for every row in the batch (one job server
+                // per push). Carried through the typed staging column -- never interpolated
+                // into SQL. Null leaves SourceJobServerId NULL on insert and untouched on
+                // update for pre-Phase-C callers.
+                row["SourceJobServerId"] = jobServerId.HasValue ? jobServerId.Value : (object)DBNull.Value;
 
                 // Allow-listed typed columns from the attribute payload (last write wins
                 // per name; only whitelisted keys; IsActive excluded above).
@@ -751,6 +765,7 @@ public class ObjectsController : ControllerBase
             UPDATE tgt SET
                     {updateSet},
                     tgt.OriginalSource = CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE tgt.OriginalSource END,
+                    tgt.SourceJobServerId = CASE WHEN src.SourceJobServerId IS NOT NULL THEN src.SourceJobServerId ELSE tgt.SourceJobServerId END,
                     tgt.ModifiedAt = SYSUTCDATETIME(),
                     tgt.LastSyncedAt = SYSUTCDATETIME(),
                     tgt.LastSeenAt = SYSUTCDATETIME(),
@@ -783,14 +798,14 @@ public class ObjectsController : ControllerBase
                         IsActive, LifecycleState, IsAuthoritative, MatchConfidence,
                         IsAdminSDHolder, PasswordNeverExpires, IsBuiltIn,
                         CreatedAt, ModifiedAt, FirstSyncedAt, LastSyncedAt, LastSeenAt,
-                        OriginalSource{(insertCols.Length > 0 ? ", " + insertCols : "")})
+                        OriginalSource, SourceJobServerId{(insertCols.Length > 0 ? ", " + insertCols : "")})
             OUTPUT 'INSERT', inserted.Id, inserted.SourceConnectionId, inserted.SourceUniqueId, CAST(NULL AS DATETIME2)
                 INTO #MergeOut (Action, ObjectId, SourceConnectionId, SourceUniqueId, PriorDeletedAt)
             SELECT NEWID(), src.SourceConnectionId, src.SourceUniqueId, src.SourceType, src.ObjectClass,
                         src.InsertIsActive, src.InsertLifecycleState, 0, 100,
                         0, 0, 0,
                         SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(),
-                        CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE NULL END{(insertVals.Length > 0 ? ", " + insertVals : "")}
+                        CASE WHEN src.HasOriginalSource = 1 THEN src.OriginalSource ELSE NULL END, src.SourceJobServerId{(insertVals.Length > 0 ? ", " + insertVals : "")}
             FROM #StagingObjects AS src
             WHERE NOT EXISTS (
                 SELECT 1 FROM Objects t
@@ -1102,6 +1117,10 @@ public class ObjectsController : ControllerBase
             if (connectionId == Guid.Empty)
                 return BadRequest(new { error = $"No active DirectoryConnection for Source '{request.Source}'" });
 
+            // Keep the Agents registry live: auto-register / refresh the pushing job
+            // server even though membership edges don't stamp Objects directly.
+            await ResolveAndRegisterJobServerAsync(request.SourceJobServerId, request.SourceJobServerName);
+
             // Collect all distinct external ids (groups + members) in one set so
             // we resolve them to Objects.Id in a single repo round-trip each.
             var groupIds = request.Memberships
@@ -1236,6 +1255,10 @@ public class ObjectsController : ControllerBase
 
             using var conn = new SqlConnection(_connectionString);
             await conn.OpenAsync();
+
+            // Keep the Agents registry live: auto-register / refresh the pushing job
+            // server even though tombstones reference existing objects (no stamp here).
+            await ResolveAndRegisterJobServerAsync(conn, request.SourceJobServerId, request.SourceJobServerName);
 
             // Count currently-live objects for THIS connection (the cap denominator).
             var liveBefore = await conn.ExecuteScalarAsync<int>(
@@ -1417,6 +1440,62 @@ public class ObjectsController : ControllerBase
               ORDER BY CreatedAt ASC",
             new { source });
         return byType ?? Guid.Empty;
+    }
+
+    /// <summary>
+    /// Resolve the incoming job-server identity (a Conduit installation's durable instance
+    /// GUID) to an Agents row, AUTO-REGISTERING one if absent -- exactly mirroring the
+    /// DirectoryConnections auto-seed: an INSERT...WHERE NOT EXISTS guarded against the
+    /// first-batch race. Returns the Agents.Id to stamp onto Objects.SourceJobServerId,
+    /// or null when no job-server id was supplied (backward compat -- the column stays NULL).
+    ///
+    /// A null/empty GUID is a pre-Phase-C caller; we leave the stamp NULL. The Agents row
+    /// is the SAME registry the /admin/agents page and the per-agent command channel use,
+    /// so a syncing Conduit becomes a first-class agent with no parallel registry.
+    /// </summary>
+    private async Task<Guid?> ResolveAndRegisterJobServerAsync(Guid? jobServerId, string? jobServerName)
+    {
+        if (!jobServerId.HasValue || jobServerId.Value == Guid.Empty)
+            return null;
+        using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync();
+        return await ResolveAndRegisterJobServerAsync(conn, jobServerId, jobServerName);
+    }
+
+    private async Task<Guid?> ResolveAndRegisterJobServerAsync(SqlConnection conn, Guid? jobServerId, string? jobServerName)
+    {
+        if (!jobServerId.HasValue || jobServerId.Value == Guid.Empty)
+            return null;
+
+        var id = jobServerId.Value;
+        var name = string.IsNullOrWhiteSpace(jobServerName)
+            ? string.Concat("Job Server ", id.ToString("N").Substring(0, 8))
+            : jobServerName.Trim();
+        if (name.Length > 256) name = name.Substring(0, 256);
+
+        // Idempotent auto-register. New rows are provenance-only (IsActive = 0): a
+        // self-asserted, X-API-Key-authenticated job server is recorded for the
+        // reassignment picker but is NOT auto-trusted as a write-back dispatch target.
+        // An operator must deliberately activate it; Phase D write-back dispatch must
+        // require IsActive = 1. On a row that already exists, refresh only the liveness
+        // signals (LastSeenAt / Version) — never touch IsActive or the operator-meaningful
+        // Name once registered.
+        var inserted = await conn.ExecuteAsync(
+            @"INSERT INTO Agents (Id, Name, Capabilities, Version, LastSeenAt, IsActive, CreatedAt)
+              SELECT @Id, @Name, '[""sync""]', 'conduit', SYSUTCDATETIME(), 0, SYSUTCDATETIME()
+              WHERE NOT EXISTS (SELECT 1 FROM Agents WHERE Id = @Id);",
+            new { Id = id, Name = name });
+        if (inserted > 0)
+        {
+            _logger.LogInformation("API: auto-registered job server in Agents registry: {Name} ({AgentId})", name, id);
+        }
+        else
+        {
+            await conn.ExecuteAsync(
+                "UPDATE Agents SET LastSeenAt = SYSUTCDATETIME(), Version = 'conduit' WHERE Id = @Id;",
+                new { Id = id });
+        }
+        return id;
     }
 
     /// <summary>Audit one ChangeAuditLogs Delete row per tombstoned object. Records

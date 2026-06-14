@@ -42,6 +42,15 @@ public class ObjectQueryItem
 public class BulkUpsertRequest
 {
     public Guid BatchId { get; set; }
+    /// <summary>
+    /// Durable instance GUID of the job server (Conduit installation) that pushed this
+    /// batch. IC resolves it to an Agents row (auto-registering one if absent) and stamps
+    /// Objects.SourceJobServerId so each object records which job server last wrote it.
+    /// Null/empty leaves SourceJobServerId NULL (pre-Phase-C callers don't set this).
+    /// </summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
     public IReadOnlyList<BulkUpsertItem> Items { get; set; } = Array.Empty<BulkUpsertItem>();
 }
 
@@ -92,6 +101,11 @@ public class GroupMembershipBulkRequest
     /// Must resolve to an existing DirectoryConnection.
     /// </summary>
     public string Source { get; set; } = string.Empty;
+    /// <summary>Durable instance GUID of the job server (Conduit installation) that pushed
+    /// these edges. Used to keep the Agents registry live (auto-register if absent).</summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
     public IReadOnlyList<GroupMembershipEdge> Memberships { get; set; } = Array.Empty<GroupMembershipEdge>();
 }
 
@@ -126,6 +140,11 @@ public class TombstoneRequest
     public Guid BatchId { get; set; }
     /// <summary>Source string identifying the connection (must resolve to a DirectoryConnection).</summary>
     public string Source { get; set; } = string.Empty;
+    /// <summary>Durable instance GUID of the job server (Conduit installation) that detected
+    /// these as absent. Used to keep the Agents registry live (auto-register if absent).</summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
     /// <summary>SourceUniqueIds to soft-delete.</summary>
     public IReadOnlyList<string> SourceUniqueIds { get; set; } = Array.Empty<string>();
     /// <summary>
