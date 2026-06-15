@@ -31,6 +31,32 @@ public class AgentRegistryRepository : DapperRepositoryBase, IAgentRegistryRepos
             return id;
         });
 
+    public Task<Agent> CreateOrGetWithIdAsync(Guid id, string name, string? location, string? capabilities, bool active = false)
+        => ExecuteAsync(async conn =>
+        {
+            // Idempotent, keyed on the caller-supplied Id (a Conduit instance GUID). Uses the
+            // same INSERT...WHERE NOT EXISTS guard as the ObjectsController auto-register, so
+            // both registration orders converge to ONE row keyed on Id with the same trust
+            // columns (Id, IsActive=0): if a bulk push already auto-registered this id, we
+            // insert nothing and the SELECT below returns that existing row untouched — its
+            // IsActive and Name are preserved. Unlike the bulk path this is enrollment, not a
+            // liveness signal, so the existing-row branch intentionally does NOT refresh
+            // LastSeenAt/Version (the two paths' INSERT column sets are not identical).
+            var inserted = await conn.ExecuteAsync(@"
+                INSERT INTO Agents (Id, Name, Location, Capabilities, IsActive, CreatedAt)
+                SELECT @Id, @Name, @Location, @Capabilities, @IsActive, SYSUTCDATETIME()
+                WHERE NOT EXISTS (SELECT 1 FROM Agents WHERE Id = @Id);",
+                new { Id = id, Name = name, Location = location, Capabilities = capabilities, IsActive = active });
+
+            if (inserted > 0)
+                _logger.LogInformation("Agent registered with caller-supplied id: {Name} ({AgentId}), IsActive={IsActive}", name, id, active);
+            else
+                _logger.LogInformation("Agent {AgentId} already registered — returning existing row unchanged", id);
+
+            return await conn.QuerySingleAsync<Agent>(
+                $"SELECT {SelectColumns} FROM Agents WHERE Id = @Id;", new { Id = id });
+        });
+
     public Task<Agent?> GetByIdAsync(Guid id)
         => ExecuteAsync(conn => conn.QuerySingleOrDefaultAsync<Agent>(
             $"SELECT {SelectColumns} FROM Agents WHERE Id = @Id;", new { Id = id }));

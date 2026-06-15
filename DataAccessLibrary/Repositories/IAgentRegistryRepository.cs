@@ -12,6 +12,19 @@ namespace DataAccessLibrary.Repositories;
 public interface IAgentRegistryRepository
 {
     Task<Guid> CreateAsync(string name, string? location);
+
+    /// <summary>
+    /// Idempotent find-or-create keyed on a CALLER-SUPPLIED Id — used when a Conduit
+    /// installation's durable instance GUID becomes its agent identity at enrollment, so
+    /// the minted key's ApiKeys.AgentId equals the provenance id stamped on
+    /// Objects.SourceJobServerId. Mirrors the ObjectsController auto-register semantics:
+    /// inserts only when absent; if a row already exists (e.g. Phase-C auto-registered it
+    /// from a prior bulk push), returns it UNCHANGED — never duplicates, never flips
+    /// IsActive, never overwrites Name. New rows default to IsActive=0: activation stays a
+    /// separate, deliberate admin act.
+    /// </summary>
+    Task<Agent> CreateOrGetWithIdAsync(Guid id, string name, string? location, string? capabilities, bool active = false);
+
     Task<Agent?> GetByIdAsync(Guid id);
     Task<List<Agent>> GetAllAsync();
     Task<List<Agent>> GetActiveAsync();
