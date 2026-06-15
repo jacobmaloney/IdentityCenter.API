@@ -142,6 +142,57 @@ public interface IObjectWriteBackService
 }
 
 /// <summary>
+/// The AWS IAM operations the agent-routed write path supports. Names match the payload contract
+/// the consuming Conduit agent obeys exactly — do not rename without updating both sides.
+/// </summary>
+public enum AwsAgentWriteOperation
+{
+    TagUser,
+    UntagUser,
+    AddGroupMember,
+    RemoveGroupMember,
+    AttachManagedPolicy,
+    DetachManagedPolicy,
+    EnableAccessKey,
+    DisableAccessKey,
+    RemoveConsoleAccess
+}
+
+/// <summary>
+/// A client-shaped AWS IAM write request. Carries ONLY the operation and its data — never the
+/// target agent, connection, or account, which the coordinator resolves server-side from the
+/// object's own provenance. No secret/access-key material exists by design.
+/// </summary>
+public sealed class AwsAgentWriteRequest
+{
+    public AwsAgentWriteOperation Operation { get; init; }
+
+    /// <summary>Tag key for Tag/UntagUser.</summary>
+    public string? TagKey { get; init; }
+
+    /// <summary>Tag value for TagUser (null for UntagUser).</summary>
+    public string? TagValue { get; init; }
+
+    /// <summary>The IAM group for Add/RemoveGroupMember.</summary>
+    public string? MemberGroupName { get; init; }
+
+    /// <summary>The subject IAM user being acted on.</summary>
+    public string? UserName { get; init; }
+
+    /// <summary>The subject IAM group, for group-targeted managed-policy attach/detach.</summary>
+    public string? GroupName { get; init; }
+
+    /// <summary>The managed-policy ARN for Attach/DetachManagedPolicy.</summary>
+    public string? PolicyArn { get; init; }
+
+    /// <summary>The access key id for Enable/DisableAccessKey.</summary>
+    public string? AccessKeyId { get; init; }
+
+    /// <summary>Human-readable summary for the audit row only — never placed in the payload.</summary>
+    public string? DisplayName { get; init; }
+}
+
+/// <summary>
 /// The AD operations the agent-routed write path supports. Names match the payload contract
 /// the consuming Conduit agent obeys exactly — do not rename without updating both sides.
 /// </summary>

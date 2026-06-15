@@ -23,7 +23,20 @@ public enum WriteCapability
     /// (Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators).
     /// Read-only by default and checked IN ADDITION to <see cref="ManageMembership"/>.
     /// </summary>
-    ManagePrivilegedGroups
+    ManagePrivilegedGroups,
+
+    /// <summary>
+    /// Apply AWS IAM writes via the Conduit agent (tag/untag user, add/remove group member,
+    /// enable/disable access key, remove console access). Read-only by default.
+    /// </summary>
+    AwsManageWrite,
+
+    /// <summary>
+    /// Override required to attach/detach AWS managed policies (the AWS analog of
+    /// <see cref="ManagePrivilegedGroups"/>). Read-only by default and checked IN ADDITION
+    /// to <see cref="AwsManageWrite"/>.
+    /// </summary>
+    AwsManagePrivileged
 }
 
 /// <summary>
