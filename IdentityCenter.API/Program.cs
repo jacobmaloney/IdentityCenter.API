@@ -187,6 +187,7 @@ builder.Services.AddScoped<ISyncExecutionRepository, SyncExecutionRepository>();
 // owns directory/audit side-effects). This is the minimal closure: NO PersonMatchingService
 // / FuzzyMatchingService needed (the orchestrator wrapper doesn't depend on them).
 builder.Services.AddScoped<ISyncObjectRepository, SyncObjectRepository>();
+builder.Services.AddScoped<ICloudActivityRepository, CloudActivityRepository>();
 builder.Services.AddScoped<ISyncRelationshipRepository, SyncRelationshipRepository>();
 builder.Services.AddScoped<ISyncScriptRepository, SyncScriptRepository>();
 builder.Services.AddScoped<ISyncRepository, SyncRepositoryFacade>();

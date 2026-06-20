@@ -42,6 +42,7 @@ public class ObjectsController : ControllerBase
     private readonly IGlobalLogger _logger;
     private readonly string _defaultConnectionString;
     private readonly ISyncObjectRepository _syncObjectRepository;
+    private readonly DataAccessLibrary.Repositories.ICloudActivityRepository _cloudActivityRepository;
     private readonly PostProcessQueue _postProcessQueue;
 
     /// <summary>
@@ -87,11 +88,13 @@ public class ObjectsController : ControllerBase
         IConfiguration configuration,
         IGlobalLogger logger,
         ISyncObjectRepository syncObjectRepository,
+        DataAccessLibrary.Repositories.ICloudActivityRepository cloudActivityRepository,
         PostProcessQueue postProcessQueue)
     {
         _configuration = configuration;
         _logger = logger;
         _syncObjectRepository = syncObjectRepository;
+        _cloudActivityRepository = cloudActivityRepository;
         _postProcessQueue = postProcessQueue;
         _defaultConnectionString = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
@@ -1337,6 +1340,129 @@ public class ObjectsController : ControllerBase
             _logger.LogError(ex, "API: sign-in batch {BatchId} failed", request.BatchId);
             return StatusCode(500, new { error = "Sign-in log ingest failed", batchId = request.BatchId });
         }
+    }
+
+    // ── Phase B Increment 2: M365 per-user usage ingest ──────────────────────
+
+    /// <summary>
+    /// Bulk-ingest per-user M365 usage rows pushed by Conduit (ObjectClass
+    /// "m365usage"). Resolves each row's user to an Objects row for the connection
+    /// by UPN (server-side — never trusts a client-supplied ObjectId), then persists
+    /// through the typed repo primitive (<c>BulkUpsertUsageReportsAsync</c>, MERGE on
+    /// ObjectId+ReportRefreshDate). Rows whose user does not resolve are counted and
+    /// dropped, never error the batch. Structurally mirrors
+    /// <see cref="BulkSignInLogs"/>: same Source resolution, same tenant-scoped
+    /// repository, same job-server registry refresh, same class-level auth policy.
+    /// </summary>
+    [HttpPost("m365-usage/bulk")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> BulkM365Usage([FromBody] M365UsageBulkRequest request)
+    {
+        if (request is null || request.Rows is null || request.Rows.Count == 0)
+            return BadRequest(new { error = "Rows is required and must be non-empty" });
+        if (string.IsNullOrWhiteSpace(request.Source) || !SourceNamePattern.IsMatch(request.Source))
+            return BadRequest(new { error = "A valid Source is required" });
+        if (request.Rows.Count > 1000)
+            return BadRequest(new { error = "Maximum 1000 usage rows per request" });
+
+        try
+        {
+            var connectionId = await ResolveConnectionIdAsync(request.Source);
+            if (connectionId == Guid.Empty)
+                return BadRequest(new { error = $"No active DirectoryConnection for Source '{request.Source}'" });
+
+            await ResolveAndRegisterJobServerAsync(request.SourceJobServerId, request.SourceJobServerName);
+
+            // Resolve every distinct UPN to an Objects.Id in one repo round-trip,
+            // scoped to THIS connection (no cross-connection / cross-tenant bleed).
+            var upns = request.Rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.UserPrincipalName))
+                .Select(r => r.UserPrincipalName!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var upnMap = upns.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsByUserPrincipalNamesAsync(connectionId, upns)
+                : new Dictionary<string, Guid>();
+
+            var reports = new List<DataAccessLibrary.Models.M365UsageReport>();
+            int usersResolved = 0, usersUnresolved = 0;
+
+            foreach (var row in request.Rows)
+            {
+                if (string.IsNullOrWhiteSpace(row.UserPrincipalName)
+                    || !upnMap.TryGetValue(row.UserPrincipalName, out var objectId))
+                {
+                    usersUnresolved++;
+                    continue;
+                }
+                usersResolved++;
+                reports.Add(MapUsageRow(row, objectId, connectionId));
+            }
+
+            int persisted = 0;
+            if (reports.Count > 0)
+                persisted = await _cloudActivityRepository.BulkUpsertUsageReportsAsync(reports);
+
+            _logger.LogInformation(
+                "API: m365 usage batch {BatchId} for '{Source}' — users {UR}/{UU}, persisted {P}",
+                request.BatchId, request.Source, usersResolved, usersUnresolved, persisted);
+
+            return Ok(new M365UsageBulkResponse
+            {
+                BatchId = request.BatchId,
+                UsersResolved = usersResolved,
+                UsersUnresolved = usersUnresolved,
+                ReportsPersisted = persisted
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API: m365 usage batch {BatchId} failed", request.BatchId);
+            return StatusCode(500, new { error = "M365 usage ingest failed", batchId = request.BatchId });
+        }
+    }
+
+    /// <summary>
+    /// Pure mapping from a resolved m365usage row to a typed M365UsageReport.
+    /// Static + dependency-free so it is directly unit-testable without a controller
+    /// instance. <paramref name="objectId"/> is the SERVER-resolved Objects.Id (never
+    /// from the request body). A missing ReportRefreshDate defaults to today's UTC
+    /// date so the upsert key (ObjectId + date) is always well-formed.
+    /// </summary>
+    public static DataAccessLibrary.Models.M365UsageReport MapUsageRow(
+        M365UsageRow row, Guid objectId, Guid connectionId)
+    {
+        return new DataAccessLibrary.Models.M365UsageReport
+        {
+            ObjectId = objectId,
+            SourceConnectionId = connectionId,
+            ReportRefreshDate = (row.ReportRefreshDate ?? DateTime.UtcNow).Date,
+            UserPrincipalName = row.UserPrincipalName,
+            DisplayName = row.DisplayName,
+            HasExchangeLicense = row.HasExchangeLicense,
+            HasOneDriveLicense = row.HasOneDriveLicense,
+            HasSharePointLicense = row.HasSharePointLicense,
+            HasTeamsLicense = row.HasTeamsLicense,
+            HasYammerLicense = row.HasYammerLicense,
+            ExchangeLastActivityDate = row.ExchangeLastActivityDate,
+            OneDriveLastActivityDate = row.OneDriveLastActivityDate,
+            SharePointLastActivityDate = row.SharePointLastActivityDate,
+            TeamsLastActivityDate = row.TeamsLastActivityDate,
+            YammerLastActivityDate = row.YammerLastActivityDate,
+            OneDriveStorageUsedBytes = row.OneDriveStorageUsedBytes,
+            OneDriveStorageAllocatedBytes = row.OneDriveStorageAllocatedBytes,
+            MailboxStorageUsedBytes = row.MailboxStorageUsedBytes,
+            MailboxQuotaBytes = row.MailboxQuotaBytes,
+            OneDriveFilesViewed = row.OneDriveFilesViewed,
+            OneDriveFilesSynced = row.OneDriveFilesSynced,
+            TeamsChatMessages = row.TeamsChatMessages,
+            TeamsCallCount = row.TeamsCallCount,
+            TeamsMeetingCount = row.TeamsMeetingCount,
+            AssignedProducts = row.AssignedProducts,
+            LastSyncedAt = DateTime.UtcNow
+        };
     }
 
     // ── Phase 2.2 Part C: tombstone soft-delete (DESTRUCTIVE — guardrailed) ──

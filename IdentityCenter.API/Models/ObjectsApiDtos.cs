@@ -247,3 +247,66 @@ public class SignInLogBulkResponse
     public int UsersUnresolved { get; set; }
     public int EventsPersisted { get; set; }
 }
+
+/// <summary>
+/// Request body for <c>POST /api/objects/m365-usage/bulk</c>. Conduit pushes the
+/// per-user M365 usage rows it joined from the Graph usage reports (ObjectClass
+/// "m365usage"); IC resolves each row's user to an Objects row for the connection
+/// by UPN and persists the typed M365UsageReport (idempotent MERGE keyed on
+/// ObjectId + ReportRefreshDate). Mirrors <see cref="SignInLogBulkRequest"/>.
+/// </summary>
+public class M365UsageBulkRequest
+{
+    public Guid BatchId { get; set; }
+    /// <summary>Source string identifying the connection these rows belong to;
+    /// must resolve to an existing DirectoryConnection (same as sign-in logs).</summary>
+    public string Source { get; set; } = string.Empty;
+    /// <summary>Durable instance GUID of the pushing job server (Conduit installation).</summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
+    public IReadOnlyList<M365UsageRow> Rows { get; set; } = Array.Empty<M365UsageRow>();
+}
+
+/// <summary>One per-user M365 usage row. UPN is the resolver to an Objects row.</summary>
+public class M365UsageRow
+{
+    /// <summary>UPN — the join key to the IC user object. Required.</summary>
+    public string? UserPrincipalName { get; set; }
+    public string? DisplayName { get; set; }
+    /// <summary>Report refresh date (the second half of the upsert key). Required.</summary>
+    public DateTime? ReportRefreshDate { get; set; }
+
+    public bool HasExchangeLicense { get; set; }
+    public bool HasOneDriveLicense { get; set; }
+    public bool HasSharePointLicense { get; set; }
+    public bool HasTeamsLicense { get; set; }
+    public bool HasYammerLicense { get; set; }
+
+    public DateTime? ExchangeLastActivityDate { get; set; }
+    public DateTime? OneDriveLastActivityDate { get; set; }
+    public DateTime? SharePointLastActivityDate { get; set; }
+    public DateTime? TeamsLastActivityDate { get; set; }
+    public DateTime? YammerLastActivityDate { get; set; }
+
+    public long? OneDriveStorageUsedBytes { get; set; }
+    public long? OneDriveStorageAllocatedBytes { get; set; }
+    public long? MailboxStorageUsedBytes { get; set; }
+    public long? MailboxQuotaBytes { get; set; }
+
+    public int? OneDriveFilesViewed { get; set; }
+    public int? OneDriveFilesSynced { get; set; }
+    public int? TeamsChatMessages { get; set; }
+    public int? TeamsCallCount { get; set; }
+    public int? TeamsMeetingCount { get; set; }
+
+    public string? AssignedProducts { get; set; }
+}
+
+public class M365UsageBulkResponse
+{
+    public Guid BatchId { get; set; }
+    public int UsersResolved { get; set; }
+    public int UsersUnresolved { get; set; }
+    public int ReportsPersisted { get; set; }
+}

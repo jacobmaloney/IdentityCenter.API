@@ -116,6 +116,12 @@ public class M365UsageReport
     public int? OneDriveFilesViewed { get; set; }
     public int? OneDriveFilesSynced { get; set; }
 
+    // Storage bytes (from getOneDriveUsageAccountDetail / getMailboxUsageDetail)
+    public long? OneDriveStorageUsedBytes { get; set; }
+    public long? OneDriveStorageAllocatedBytes { get; set; }
+    public long? MailboxStorageUsedBytes { get; set; }
+    public long? MailboxQuotaBytes { get; set; }
+
     // SharePoint usage metrics
     public int? SharePointFilesViewed { get; set; }
     public int? SharePointFilesShared { get; set; }

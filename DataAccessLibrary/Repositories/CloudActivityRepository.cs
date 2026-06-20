@@ -12,15 +12,22 @@ namespace DataAccessLibrary.Repositories;
 /// </summary>
 public class CloudActivityRepository : ICloudActivityRepository
 {
-    private readonly string _connectionString;
+    private readonly string _defaultConnectionString;
     private readonly IGlobalLogger _logger;
 
     public CloudActivityRepository(IConfiguration configuration, IGlobalLogger logger)
     {
-        _connectionString = configuration.GetConnectionString("DefaultConnection")
+        _defaultConnectionString = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    // Resolved PER CALL via the ambient tenant accessor so a tenant-scoped API
+    // request hits ONLY its own DB; falls back to DefaultConnection for the
+    // in-process orchestrator / admin (no resolver installed). Matches the
+    // sign-in-log ingest path's tenant scoping exactly.
+    private string _connectionString =>
+        DataAccessLibrary.ControlPlane.TenantConnectionAccessor.Current?.Resolve() ?? _defaultConnectionString;
 
     private SqlConnection CreateConnection() => new SqlConnection(_connectionString);
 
@@ -189,6 +196,10 @@ public class CloudActivityRepository : ICloudActivityRepository
                     ExchangeMailReceived = @ExchangeMailReceived,
                     OneDriveFilesViewed = @OneDriveFilesViewed,
                     OneDriveFilesSynced = @OneDriveFilesSynced,
+                    OneDriveStorageUsedBytes = @OneDriveStorageUsedBytes,
+                    OneDriveStorageAllocatedBytes = @OneDriveStorageAllocatedBytes,
+                    MailboxStorageUsedBytes = @MailboxStorageUsedBytes,
+                    MailboxQuotaBytes = @MailboxQuotaBytes,
                     SharePointFilesViewed = @SharePointFilesViewed,
                     SharePointFilesShared = @SharePointFilesShared,
                     TeamsChatMessages = @TeamsChatMessages,
@@ -205,6 +216,8 @@ public class CloudActivityRepository : ICloudActivityRepository
                         SharePointLastActivityDate, TeamsLastActivityDate, YammerLastActivityDate,
                         ExchangeMailSent, ExchangeMailReceived,
                         OneDriveFilesViewed, OneDriveFilesSynced,
+                        OneDriveStorageUsedBytes, OneDriveStorageAllocatedBytes,
+                        MailboxStorageUsedBytes, MailboxQuotaBytes,
                         SharePointFilesViewed, SharePointFilesShared,
                         TeamsChatMessages, TeamsCallCount, TeamsMeetingCount,
                         AssignedProducts, LastSyncedAt)
@@ -216,6 +229,8 @@ public class CloudActivityRepository : ICloudActivityRepository
                         @SharePointLastActivityDate, @TeamsLastActivityDate, @YammerLastActivityDate,
                         @ExchangeMailSent, @ExchangeMailReceived,
                         @OneDriveFilesViewed, @OneDriveFilesSynced,
+                        @OneDriveStorageUsedBytes, @OneDriveStorageAllocatedBytes,
+                        @MailboxStorageUsedBytes, @MailboxQuotaBytes,
                         @SharePointFilesViewed, @SharePointFilesShared,
                         @TeamsChatMessages, @TeamsCallCount, @TeamsMeetingCount,
                         @AssignedProducts, @LastSyncedAt);";
@@ -251,6 +266,10 @@ public class CloudActivityRepository : ICloudActivityRepository
                 report.ExchangeMailReceived,
                 report.OneDriveFilesViewed,
                 report.OneDriveFilesSynced,
+                report.OneDriveStorageUsedBytes,
+                report.OneDriveStorageAllocatedBytes,
+                report.MailboxStorageUsedBytes,
+                report.MailboxQuotaBytes,
                 report.SharePointFilesViewed,
                 report.SharePointFilesShared,
                 report.TeamsChatMessages,
