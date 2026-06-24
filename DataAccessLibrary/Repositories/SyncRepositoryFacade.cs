@@ -101,6 +101,9 @@ public class SyncRepositoryFacade : ISyncRepository
     public Task<int> BulkInsertSignInLogsAsync(List<SignInLog> logs, CancellationToken cancellationToken = default)
         => _objectRepo.BulkInsertSignInLogsAsync(logs, cancellationToken);
 
+    public Task<(int PoolsUpserted, int AssignmentsPersisted)> BulkUpsertLicenseAssignmentsAsync(Guid sourceConnectionId, List<LicensePoolUpsert> pools, List<LicenseAssignmentUpsert> assignments, CancellationToken cancellationToken = default)
+        => _objectRepo.BulkUpsertLicenseAssignmentsAsync(sourceConnectionId, pools, assignments, cancellationToken);
+
     public Task<int> MarkRemovedObjectGroupMembershipsAsync(Guid objectId, List<Guid> currentGroupIds, CancellationToken cancellationToken = default)
         => _objectRepo.MarkRemovedObjectGroupMembershipsAsync(objectId, currentGroupIds, cancellationToken);
 

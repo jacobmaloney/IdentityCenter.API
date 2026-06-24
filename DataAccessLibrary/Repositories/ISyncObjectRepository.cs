@@ -79,6 +79,19 @@ public interface ISyncObjectRepository
     Task<int> BulkInsertSignInLogsAsync(
         List<SignInLog> logs, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Upsert Entra license-assignment data pushed by Conduit. Upserts the org-level
+    /// <c>LicensePools</c> SKU inventory (keyed on connection + SkuId) and the per-user
+    /// <c>LicenseAssignments</c> (keyed on pool + ObjectId). Idempotent: re-posting the
+    /// same data updates capacity/usage in place rather than duplicating. Returns the
+    /// count of assignment rows upserted.
+    /// </summary>
+    Task<(int PoolsUpserted, int AssignmentsPersisted)> BulkUpsertLicenseAssignmentsAsync(
+        Guid sourceConnectionId,
+        List<LicensePoolUpsert> pools,
+        List<LicenseAssignmentUpsert> assignments,
+        CancellationToken cancellationToken = default);
+
     Task<int> MarkRemovedObjectGroupMembershipsAsync(
         Guid objectId, List<Guid> currentGroupIds, CancellationToken cancellationToken = default);
 
@@ -101,3 +114,21 @@ public interface ISyncObjectRepository
 
     Task<DataStatisticsResult> GetDataStatisticsAsync(CancellationToken cancellationToken = default);
 }
+
+/// <summary>One org-level license SKU pool to upsert (keyed on connection + SkuId).</summary>
+public sealed record LicensePoolUpsert(
+    string SkuId,
+    string SkuName,
+    string? SkuPartNumber,
+    int TotalUnits,
+    int ConsumedUnits,
+    int WarningUnits,
+    int SuspendedUnits);
+
+/// <summary>One per-user license assignment to upsert. ObjectId is already resolved
+/// (server-side, never client-trusted); SkuId links it to its pool.</summary>
+public sealed record LicenseAssignmentUpsert(
+    Guid ObjectId,
+    string SkuId,
+    DateTime? AssignedAt,
+    string AssignmentSource);

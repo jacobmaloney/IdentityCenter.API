@@ -354,6 +354,23 @@ public class IdentitiesController : ControllerBase
             string? matchedBy = null;
             double confidence = 0;
 
+            // 0) Directory key bridge. Conduit's Lookup/PersonMatch steps hand over the
+            //    object's own SourceUniqueId (AD objectGUID / Entra id) — a deterministic
+            //    directory key, not a person attribute. It lives on the Objects row, which
+            //    (once correlated) carries IdentityId. Bridge through it so an AD-sourced
+            //    object whose only id is an objectGUID still resolves to its person. A DN
+            //    is accepted on the same bridge (Objects.DN). DeletedAt IS NULL so a
+            //    soft-deleted object never produces a phantom person match.
+            if (!string.IsNullOrWhiteSpace(request.SourceUniqueId))
+            {
+                matchedId = await conn.ExecuteScalarAsync<Guid?>(
+                    @"SELECT TOP 1 IdentityId FROM Objects
+                      WHERE (SourceUniqueId = @Sid OR DN = @Sid)
+                        AND IdentityId IS NOT NULL AND DeletedAt IS NULL",
+                    new { Sid = request.SourceUniqueId });
+                if (matchedId is not null) { matchedBy = "sourceUniqueId"; confidence = 1.0; goto done; }
+            }
+
             if (!string.IsNullOrWhiteSpace(keys.Upn))
             {
                 matchedId = await conn.ExecuteScalarAsync<Guid?>(
@@ -371,6 +388,13 @@ public class IdentitiesController : ControllerBase
                 matchedId = await conn.ExecuteScalarAsync<Guid?>(
                     "SELECT TOP 1 Id FROM Identities WHERE EmployeeId = @EmployeeId", new { keys.EmployeeId });
                 if (matchedId is not null) { matchedBy = "employeeId"; confidence = 0.9; goto done; }
+            }
+            if (!string.IsNullOrWhiteSpace(keys.Username))
+            {
+                matchedId = await conn.ExecuteScalarAsync<Guid?>(
+                    "SELECT TOP 1 Id FROM Identities WHERE Username = @Username OR UserPrincipalName = @Username",
+                    new { keys.Username });
+                if (matchedId is not null) { matchedBy = "username"; confidence = 0.85; goto done; }
             }
             if (!string.IsNullOrWhiteSpace(keys.FirstName) && !string.IsNullOrWhiteSpace(keys.LastName))
             {
@@ -424,9 +448,7 @@ public class IdentitiesController : ControllerBase
             Guid? managerId = request.ManagerIdentityId;
             if (managerId is null)
             {
-                managerId = await conn.ExecuteScalarAsync<Guid?>(
-                    "SELECT TOP 1 Id FROM Identities WHERE PrimaryEmail = @ExternalId",
-                    new { ExternalId = request.ManagerExternalId });
+                managerId = await ResolveManagerIdentityIdAsync(conn, request.ManagerExternalId!);
                 if (managerId is null)
                     return NotFound(new { error = $"Manager '{request.ManagerExternalId}' not found among Identities." });
             }
@@ -443,6 +465,63 @@ public class IdentitiesController : ControllerBase
             _logger.LogError(ex, "Failed to assign manager for {Id}", id);
             return StatusCode(500, new { error = "Failed to assign manager" });
         }
+    }
+
+    /// <summary>
+    /// Resolve a manager *external id* (as Conduit's Lookup step hands it over) to an
+    /// IC Identity GUID. The reference shape depends on the source directory:
+    /// <list type="bullet">
+    ///   <item>Entra ID / email-keyed sources emit a UPN or SMTP address → matches
+    ///   <c>Identities.PrimaryEmail</c> / <c>SecondaryEmail</c> / <c>UserPrincipalName</c>.</item>
+    ///   <item>Active Directory emits the <c>manager</c> attribute as a DISTINGUISHED NAME.
+    ///   A DN matches none of the Identities email/UPN columns, so we bridge through the
+    ///   <c>Objects</c> table: <c>Objects.DN = &lt;dn&gt;</c> → <c>Objects.IdentityId</c>
+    ///   (the manager object's already-correlated person). This is what makes AD manager
+    ///   resolution work the same way cloud sources already do.</item>
+    ///   <item>sAMAccountName (bare account name) → <c>Identities.Username</c>.</item>
+    /// </list>
+    /// Every probe is an exact, parameterized, case-insensitive (server collation)
+    /// equality match — no caller string ever influences SQL structure. Returns null
+    /// when nothing matches so the caller can answer 404 (a truthful "unresolved",
+    /// never a silent wrong link). Probes run strongest-key-first and short-circuit.
+    /// </summary>
+    private static async Task<Guid?> ResolveManagerIdentityIdAsync(SqlConnection conn, string externalId)
+    {
+        if (string.IsNullOrWhiteSpace(externalId)) return null;
+
+        // 1) Email / UPN columns on Identities (covers Entra UPN + SMTP references).
+        var byEmailOrUpn = await conn.ExecuteScalarAsync<Guid?>(
+            @"SELECT TOP 1 Id FROM Identities
+              WHERE PrimaryEmail = @Ext OR SecondaryEmail = @Ext OR UserPrincipalName = @Ext",
+            new { Ext = externalId });
+        if (byEmailOrUpn is not null) return byEmailOrUpn;
+
+        // 2) DN bridge: AD `manager` is a DN. The manager's directory Object carries
+        //    that DN and (once person-matched) an IdentityId. Resolve through it.
+        //    DeletedAt IS NULL: never link a manager via a soft-deleted object.
+        if (externalId.Contains('=') && externalId.Contains(','))
+        {
+            var byDn = await conn.ExecuteScalarAsync<Guid?>(
+                @"SELECT TOP 1 IdentityId FROM Objects
+                  WHERE DN = @Ext AND IdentityId IS NOT NULL AND DeletedAt IS NULL",
+                new { Ext = externalId });
+            if (byDn is not null) return byDn;
+        }
+
+        // 3) sAMAccountName / bare account name → Identities.Username.
+        var byUsername = await conn.ExecuteScalarAsync<Guid?>(
+            "SELECT TOP 1 Id FROM Identities WHERE Username = @Ext",
+            new { Ext = externalId });
+        if (byUsername is not null) return byUsername;
+
+        // 4) Last resort: the manager's directory Object matched by its own source
+        //    unique id (objectGUID) — covers a Conduit projection that hands the
+        //    manager's resolvable key instead of a raw DN. DeletedAt IS NULL.
+        var bySourceUniqueId = await conn.ExecuteScalarAsync<Guid?>(
+            @"SELECT TOP 1 IdentityId FROM Objects
+              WHERE SourceUniqueId = @Ext AND IdentityId IS NOT NULL AND DeletedAt IS NULL",
+            new { Ext = externalId });
+        return bySourceUniqueId;
     }
 
     // ── Table-to-table connector endpoints (Conduit IdentityCenter, table=Identities) ──

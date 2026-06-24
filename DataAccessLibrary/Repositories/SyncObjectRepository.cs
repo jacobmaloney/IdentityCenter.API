@@ -2651,6 +2651,138 @@ IF NOT EXISTS (SELECT 1 FROM Objects WHERE SourceConnectionId=@{p}_ConnId AND So
         }
     }
 
+    public async Task<(int PoolsUpserted, int AssignmentsPersisted)> BulkUpsertLicenseAssignmentsAsync(
+        Guid sourceConnectionId,
+        List<LicensePoolUpsert> pools,
+        List<LicenseAssignmentUpsert> assignments,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogMethodEntry(nameof(BulkUpsertLicenseAssignmentsAsync),
+            new { sourceConnectionId, pools = pools?.Count ?? 0, assignments = assignments?.Count ?? 0 });
+
+        try
+        {
+            if ((pools is null || pools.Count == 0) && (assignments is null || assignments.Count == 0))
+                return (0, 0);
+
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            int poolsUpserted = 0;
+            // 1) Upsert each SKU pool keyed on (SourceConnectionId, SkuId). Pools are
+            //    few (org SKU count), so a per-pool parameterized MERGE is fine and
+            //    keeps the AvailableUnits computed column intact. Refresh capacity +
+            //    usage in place; create when absent.
+            foreach (var p in (pools ?? new List<LicensePoolUpsert>()))
+            {
+                if (string.IsNullOrWhiteSpace(p.SkuId)) continue;
+                poolsUpserted += await connection.ExecuteAsync(@"
+                    MERGE LicensePools AS target
+                    USING (SELECT @SourceConnectionId AS SourceConnectionId, @SkuId AS SkuId) AS source
+                    ON (target.SourceConnectionId = source.SourceConnectionId AND target.SkuId = source.SkuId)
+                    WHEN MATCHED THEN UPDATE SET
+                        SkuName = @SkuName, SkuPartNumber = @SkuPartNumber,
+                        TotalUnits = @TotalUnits, ConsumedUnits = @ConsumedUnits,
+                        WarningUnits = @WarningUnits, SuspendedUnits = @SuspendedUnits,
+                        LastSyncedAt = GETUTCDATE(), IsActive = 1
+                    WHEN NOT MATCHED THEN
+                        INSERT (Id, SourceConnectionId, SkuId, SkuName, SkuPartNumber,
+                                TotalUnits, ConsumedUnits, WarningUnits, SuspendedUnits,
+                                LastSyncedAt, IsActive)
+                        VALUES (NEWID(), @SourceConnectionId, @SkuId, @SkuName, @SkuPartNumber,
+                                @TotalUnits, @ConsumedUnits, @WarningUnits, @SuspendedUnits,
+                                GETUTCDATE(), 1);",
+                    new
+                    {
+                        SourceConnectionId = sourceConnectionId,
+                        p.SkuId, p.SkuName, p.SkuPartNumber,
+                        p.TotalUnits, p.ConsumedUnits, p.WarningUnits, p.SuspendedUnits
+                    }, commandTimeout: 60);
+            }
+
+            if (assignments is null || assignments.Count == 0)
+                return (poolsUpserted, 0);
+
+            // 2) Resolve SkuId -> LicensePoolId for THIS connection in one round-trip.
+            var poolMap = (await connection.QueryAsync<(string SkuId, Guid Id)>(
+                "SELECT SkuId, Id FROM LicensePools WHERE SourceConnectionId = @Cid",
+                new { Cid = sourceConnectionId }, commandTimeout: 60))
+                .GroupBy(r => r.SkuId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
+
+            // 3) Bulk-copy assignments to a temp table, then MERGE keyed on
+            //    (LicensePoolId, ObjectId). Rows whose SKU has no pool are dropped.
+            await connection.ExecuteAsync(@"
+                CREATE TABLE #TempLicenseAssignments (
+                    LicensePoolId    UNIQUEIDENTIFIER NOT NULL,
+                    ObjectId         UNIQUEIDENTIFIER NOT NULL,
+                    AssignedAt       DATETIME2        NULL,
+                    AssignmentSource NVARCHAR(50)     NOT NULL
+                )", commandTimeout: 30);
+
+            var dataTable = new DataTable();
+            dataTable.Columns.Add("LicensePoolId", typeof(Guid));
+            dataTable.Columns.Add("ObjectId", typeof(Guid));
+            dataTable.Columns.Add("AssignedAt", typeof(DateTime));
+            dataTable.Columns.Add("AssignmentSource", typeof(string));
+
+            foreach (var a in assignments)
+            {
+                if (!poolMap.TryGetValue(a.SkuId, out var poolId)) continue;
+                dataTable.Rows.Add(
+                    poolId,
+                    a.ObjectId,
+                    (object?)a.AssignedAt ?? DBNull.Value,
+                    string.IsNullOrWhiteSpace(a.AssignmentSource) ? "Direct" : a.AssignmentSource);
+            }
+
+            if (dataTable.Rows.Count == 0)
+            {
+                await connection.ExecuteAsync("DROP TABLE #TempLicenseAssignments");
+                return (poolsUpserted, 0);
+            }
+
+            using (var bulkCopy = new SqlBulkCopy(connection))
+            {
+                bulkCopy.DestinationTableName = "#TempLicenseAssignments";
+                bulkCopy.BulkCopyTimeout = 120;
+                foreach (DataColumn col in dataTable.Columns)
+                    bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
+            }
+
+            var affected = await connection.ExecuteScalarAsync<int>(@"
+                DECLARE @Affected INT = 0;
+
+                MERGE LicenseAssignments AS target
+                USING #TempLicenseAssignments AS source
+                ON (target.LicensePoolId = source.LicensePoolId AND target.ObjectId = source.ObjectId)
+                WHEN MATCHED THEN UPDATE SET
+                    AssignedAt = source.AssignedAt,
+                    AssignmentSource = source.AssignmentSource,
+                    IsActive = 1,
+                    LastSyncedAt = GETUTCDATE()
+                WHEN NOT MATCHED THEN
+                    INSERT (Id, LicensePoolId, ObjectId, AssignedAt, AssignmentSource, IsActive, LastSyncedAt)
+                    VALUES (NEWID(), source.LicensePoolId, source.ObjectId, source.AssignedAt, source.AssignmentSource, 1, GETUTCDATE());
+
+                SET @Affected = @@ROWCOUNT;
+                DROP TABLE #TempLicenseAssignments;
+                SELECT @Affected;
+            ", commandTimeout: 120);
+
+            _logger.LogInformation(
+                "Upserted {Pools} license pool(s) and {Assignments} assignment(s) for connection {Cid}",
+                poolsUpserted, affected, sourceConnectionId);
+
+            return (poolsUpserted, affected);
+        }
+        finally
+        {
+            _logger.LogMethodExit(nameof(BulkUpsertLicenseAssignmentsAsync));
+        }
+    }
+
     public async Task<int> MarkRemovedObjectGroupMembershipsAsync(
         Guid objectId,
         List<Guid> currentGroupIds,

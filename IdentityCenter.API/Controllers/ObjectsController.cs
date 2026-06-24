@@ -1424,6 +1424,236 @@ public class ObjectsController : ControllerBase
         }
     }
 
+    // ── License-assignment ingest (Entra subscribedSkus + assignedLicenses) ───
+
+    /// <summary>
+    /// Bulk-ingest Entra license-assignment rows pushed by Conduit (ObjectClass
+    /// "license"). Upserts the org-level <c>LicensePools</c> SKU inventory and resolves
+    /// each row's user to an Objects row for the connection (by UPN, falling back to
+    /// objectGUID — server-side, NEVER trusting a client-supplied ObjectId), then
+    /// upserts the per-user <c>LicenseAssignments</c> through the typed repo primitive
+    /// (<c>BulkUpsertLicenseAssignmentsAsync</c>). Rows whose user does not resolve are
+    /// counted and dropped, never error the batch. Structurally mirrors
+    /// <see cref="BulkM365Usage"/>: same Source resolution, same tenant-scoped
+    /// repository, same job-server registry refresh, same class-level auth policy.
+    /// </summary>
+    [HttpPost("licenses/bulk")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> BulkLicenses([FromBody] LicenseBulkRequest request)
+    {
+        if (request is null || request.Rows is null || request.Rows.Count == 0)
+            return BadRequest(new { error = "Rows is required and must be non-empty" });
+        if (string.IsNullOrWhiteSpace(request.Source) || !SourceNamePattern.IsMatch(request.Source))
+            return BadRequest(new { error = "A valid Source is required" });
+        if (request.Rows.Count > 1000)
+            return BadRequest(new { error = "Maximum 1000 license rows per request" });
+
+        try
+        {
+            var connectionId = await ResolveConnectionIdAsync(request.Source);
+            if (connectionId == Guid.Empty)
+                return BadRequest(new { error = $"No active DirectoryConnection for Source '{request.Source}'" });
+
+            await ResolveAndRegisterJobServerAsync(request.SourceJobServerId, request.SourceJobServerName);
+
+            // Resolve users: UPN first (one round-trip), objectGUID fallback for the rest.
+            var upns = request.Rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.UserPrincipalName))
+                .Select(r => r.UserPrincipalName!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var upnMap = upns.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsByUserPrincipalNamesAsync(connectionId, upns)
+                : new Dictionary<string, Guid>();
+
+            var unresolvedSids = request.Rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.UserSourceUniqueId)
+                            && (string.IsNullOrWhiteSpace(r.UserPrincipalName) || !upnMap.ContainsKey(r.UserPrincipalName!)))
+                .Select(r => r.UserSourceUniqueId!)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var sidMap = unresolvedSids.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsBySourceUniqueIdsAsync(connectionId, unresolvedSids)
+                : new Dictionary<string, Guid>();
+
+            // Distinct SKU pools (pool-level fields are identical across a SKU's rows;
+            // take the first occurrence). Capacity counts default to 0 when Graph omits them.
+            var pools = request.Rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.SkuId))
+                .GroupBy(r => r.SkuId, StringComparer.OrdinalIgnoreCase)
+                .Select(g =>
+                {
+                    var r = g.First();
+                    return new DataAccessLibrary.Repositories.LicensePoolUpsert(
+                        SkuId: r.SkuId,
+                        SkuName: string.IsNullOrWhiteSpace(r.SkuName) ? r.SkuId : r.SkuName,
+                        SkuPartNumber: r.SkuPartNumber,
+                        TotalUnits: r.TotalUnits ?? 0,
+                        ConsumedUnits: r.ConsumedUnits ?? 0,
+                        WarningUnits: r.WarningUnits ?? 0,
+                        SuspendedUnits: r.SuspendedUnits ?? 0);
+                })
+                .ToList();
+
+            var assignments = new List<DataAccessLibrary.Repositories.LicenseAssignmentUpsert>();
+            int usersResolved = 0, usersUnresolved = 0;
+            foreach (var row in request.Rows)
+            {
+                if (string.IsNullOrWhiteSpace(row.SkuId)) continue;
+
+                Guid objectId;
+                if (!string.IsNullOrWhiteSpace(row.UserPrincipalName) && upnMap.TryGetValue(row.UserPrincipalName!, out var oId))
+                    objectId = oId;
+                else if (!string.IsNullOrWhiteSpace(row.UserSourceUniqueId) && sidMap.TryGetValue(row.UserSourceUniqueId!, out var sId))
+                    objectId = sId;
+                else
+                {
+                    usersUnresolved++;
+                    continue;
+                }
+                usersResolved++;
+                assignments.Add(new DataAccessLibrary.Repositories.LicenseAssignmentUpsert(
+                    ObjectId: objectId,
+                    SkuId: row.SkuId,
+                    AssignedAt: row.AssignedAt,
+                    AssignmentSource: string.IsNullOrWhiteSpace(row.AssignmentSource) ? "Direct" : row.AssignmentSource!));
+            }
+
+            var (poolsUpserted, assignmentsPersisted) =
+                await _syncObjectRepository.BulkUpsertLicenseAssignmentsAsync(connectionId, pools, assignments);
+
+            _logger.LogInformation(
+                "API: license batch {BatchId} for '{Source}' — pools {P}, users {UR}/{UU}, assignments {AP}",
+                request.BatchId, request.Source, poolsUpserted, usersResolved, usersUnresolved, assignmentsPersisted);
+
+            return Ok(new LicenseBulkResponse
+            {
+                BatchId = request.BatchId,
+                PoolsUpserted = poolsUpserted,
+                UsersResolved = usersResolved,
+                UsersUnresolved = usersUnresolved,
+                AssignmentsPersisted = assignmentsPersisted
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API: license batch {BatchId} failed", request.BatchId);
+            return StatusCode(500, new { error = "License ingest failed", batchId = request.BatchId });
+        }
+    }
+
+    // ── App-role-assignment ingest (Entra enterprise-app access) ─────────────
+
+    /// <summary>
+    /// Bulk-ingest Entra enterprise-app role assignments pushed by Conduit (ObjectClass
+    /// "approleassignment"). Resolves each assignment's principal AND resource service
+    /// principal to Objects rows for the connection (by objectGUID — server-side),
+    /// then inserts through the EXISTING typed repo primitive
+    /// (<c>BulkUpsertAppRoleAssignmentsAsync</c>, idempotent on connection +
+    /// AppRoleAssignmentId). Object resolution is best-effort: an unresolved principal
+    /// or resource is stored with a null FK (Entra GUID + display name retained) rather
+    /// than dropping the assignment, because the enterprise app's SP may not be in the
+    /// synced scope. Structurally mirrors <see cref="BulkM365Usage"/>.
+    /// </summary>
+    [HttpPost("app-role-assignments/bulk")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> BulkAppRoleAssignments([FromBody] AppRoleAssignmentBulkRequest request)
+    {
+        if (request is null || request.Rows is null || request.Rows.Count == 0)
+            return BadRequest(new { error = "Rows is required and must be non-empty" });
+        if (string.IsNullOrWhiteSpace(request.Source) || !SourceNamePattern.IsMatch(request.Source))
+            return BadRequest(new { error = "A valid Source is required" });
+        if (request.Rows.Count > 1000)
+            return BadRequest(new { error = "Maximum 1000 app-role rows per request" });
+
+        try
+        {
+            var connectionId = await ResolveConnectionIdAsync(request.Source);
+            if (connectionId == Guid.Empty)
+                return BadRequest(new { error = $"No active DirectoryConnection for Source '{request.Source}'" });
+
+            await ResolveAndRegisterJobServerAsync(request.SourceJobServerId, request.SourceJobServerName);
+
+            // Resolve principal + resource GUIDs to Objects.Id in one round-trip each
+            // (both are objectGUIDs keyed on Objects.SourceUniqueId for this connection).
+            var allGuids = request.Rows
+                .SelectMany(r => new[] { r.PrincipalId, r.ResourceId })
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Select(s => s!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var objMap = allGuids.Count > 0
+                ? await _syncObjectRepository.GetObjectIdsBySourceUniqueIdsAsync(connectionId, allGuids)
+                : new Dictionary<string, Guid>();
+
+            var assignments = new List<DataAccessLibrary.Models.AppRoleAssignment>(request.Rows.Count);
+            int principalsResolved = 0, principalsUnresolved = 0;
+
+            foreach (var row in request.Rows)
+            {
+                Guid? principalObjectId = null;
+                if (!string.IsNullOrWhiteSpace(row.PrincipalId) && objMap.TryGetValue(row.PrincipalId!, out var pObj))
+                {
+                    principalObjectId = pObj;
+                    principalsResolved++;
+                }
+                else
+                {
+                    principalsUnresolved++;
+                }
+
+                Guid? resourceObjectId = null;
+                if (!string.IsNullOrWhiteSpace(row.ResourceId) && objMap.TryGetValue(row.ResourceId!, out var rObj))
+                    resourceObjectId = rObj;
+
+                assignments.Add(new DataAccessLibrary.Models.AppRoleAssignment
+                {
+                    SourceConnectionId = connectionId,
+                    AppRoleAssignmentId = row.AppRoleAssignmentId,
+                    PrincipalId = ParseNullableGuid(row.PrincipalId),
+                    PrincipalObjectId = principalObjectId,
+                    PrincipalType = string.IsNullOrWhiteSpace(row.PrincipalType) ? "User" : row.PrincipalType!,
+                    PrincipalDisplayName = row.PrincipalDisplayName,
+                    ResourceId = ParseNullableGuid(row.ResourceId),
+                    ResourceObjectId = resourceObjectId,
+                    ResourceDisplayName = row.ResourceDisplayName ?? string.Empty,
+                    AppRoleId = ParseNullableGuid(row.AppRoleId),
+                    AppRoleName = row.AppRoleName,
+                    CreatedDateTime = row.CreatedDateTime,
+                    IsActive = true,
+                    LastSyncedAt = DateTime.UtcNow
+                });
+            }
+
+            int persisted = 0;
+            if (assignments.Count > 0)
+                persisted = await _cloudActivityRepository.BulkUpsertAppRoleAssignmentsAsync(assignments);
+
+            _logger.LogInformation(
+                "API: app-role batch {BatchId} for '{Source}' — principals {PR}/{PU}, persisted {P}",
+                request.BatchId, request.Source, principalsResolved, principalsUnresolved, persisted);
+
+            return Ok(new AppRoleAssignmentBulkResponse
+            {
+                BatchId = request.BatchId,
+                PrincipalsResolved = principalsResolved,
+                PrincipalsUnresolved = principalsUnresolved,
+                AssignmentsPersisted = persisted
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API: app-role batch {BatchId} failed", request.BatchId);
+            return StatusCode(500, new { error = "App-role ingest failed", batchId = request.BatchId });
+        }
+    }
+
+    /// <summary>Parse a string into a nullable Guid; null/blank/invalid -> null.</summary>
+    private static Guid? ParseNullableGuid(string? v) =>
+        Guid.TryParse(v, out var g) ? g : (Guid?)null;
+
     /// <summary>
     /// Pure mapping from a resolved m365usage row to a typed M365UsageReport.
     /// Static + dependency-free so it is directly unit-testable without a controller

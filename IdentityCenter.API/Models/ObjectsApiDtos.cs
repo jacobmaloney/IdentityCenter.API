@@ -310,3 +310,112 @@ public class M365UsageBulkResponse
     public int UsersUnresolved { get; set; }
     public int ReportsPersisted { get; set; }
 }
+
+/// <summary>
+/// Request body for <c>POST /api/objects/licenses/bulk</c>. Conduit pushes the
+/// Entra license-assignment rows it read from Graph (<c>/subscribedSkus</c> joined
+/// with each user's <c>assignedLicenses</c>); IC upserts the org-level
+/// <c>LicensePools</c> SKU inventory and resolves each row's user (by UPN, falling
+/// back to objectGUID) to an Objects row, then upserts the per-user
+/// <c>LicenseAssignments</c>. Idempotent — re-posting the same rows is a no-op
+/// (pool upsert keyed on connection+SkuId, assignment upsert keyed on
+/// pool+ObjectId). Mirrors <see cref="M365UsageBulkRequest"/> for Source / job
+/// server / batching semantics.
+/// </summary>
+public class LicenseBulkRequest
+{
+    public Guid BatchId { get; set; }
+    /// <summary>Source string identifying the connection these rows belong to;
+    /// must resolve to an existing DirectoryConnection (same as usage / sign-in).</summary>
+    public string Source { get; set; } = string.Empty;
+    /// <summary>Durable instance GUID of the pushing job server (Conduit installation).</summary>
+    public Guid? SourceJobServerId { get; set; }
+    /// <summary>Friendly name of the job server, used as the auto-registered Agents.Name.</summary>
+    public string? SourceJobServerName { get; set; }
+    public IReadOnlyList<LicenseAssignmentRow> Rows { get; set; } = Array.Empty<LicenseAssignmentRow>();
+}
+
+/// <summary>
+/// One per-user, per-SKU license assignment row. The SKU fields describe the pool
+/// (org-level inventory); the user fields resolve the assignee. A user holding N
+/// SKUs produces N rows.
+/// </summary>
+public class LicenseAssignmentRow
+{
+    /// <summary>Entra SKU id (subscribedSku skuId GUID). Required — the pool key.</summary>
+    public string SkuId { get; set; } = string.Empty;
+    /// <summary>Human SKU name (e.g. "ENTERPRISEPACK"). Required for display.</summary>
+    public string SkuName { get; set; } = string.Empty;
+    /// <summary>SKU part number, when distinct from SkuName.</summary>
+    public string? SkuPartNumber { get; set; }
+    /// <summary>Pool capacity (subscribedSku prepaidUnits.enabled). Pool-level; same for every row of this SKU.</summary>
+    public int? TotalUnits { get; set; }
+    public int? ConsumedUnits { get; set; }
+    public int? WarningUnits { get; set; }
+    public int? SuspendedUnits { get; set; }
+
+    /// <summary>UPN — the join key to the IC user object. Required.</summary>
+    public string? UserPrincipalName { get; set; }
+    /// <summary>Entra userId / objectGUID — fallback resolver when UPN does not match.</summary>
+    public string? UserSourceUniqueId { get; set; }
+    /// <summary>When the license was assigned, if Graph supplied it.</summary>
+    public DateTime? AssignedAt { get; set; }
+    /// <summary>"Direct" or "Group" (inherited via group-based licensing).</summary>
+    public string? AssignmentSource { get; set; }
+}
+
+public class LicenseBulkResponse
+{
+    public Guid BatchId { get; set; }
+    public int PoolsUpserted { get; set; }
+    public int UsersResolved { get; set; }
+    public int UsersUnresolved { get; set; }
+    public int AssignmentsPersisted { get; set; }
+}
+
+/// <summary>
+/// Request body for <c>POST /api/objects/app-role-assignments/bulk</c>. Conduit
+/// pushes the Entra enterprise-app role assignments it read from Graph
+/// (<c>servicePrincipals/{id}/appRoleAssignedTo</c>); IC resolves each assignment's
+/// principal AND resource service principal to Objects rows (by objectGUID), then
+/// inserts the <c>AppRoleAssignments</c> through the EXISTING repo primitive
+/// (<c>BulkUpsertAppRoleAssignmentsAsync</c>, idempotent on connection +
+/// AppRoleAssignmentId). Object resolution is best-effort: an unresolved principal
+/// or resource is stored as a null FK (the Entra GUID + display name are still
+/// retained), never dropping the assignment. Mirrors <see cref="M365UsageBulkRequest"/>.
+/// </summary>
+public class AppRoleAssignmentBulkRequest
+{
+    public Guid BatchId { get; set; }
+    public string Source { get; set; } = string.Empty;
+    public Guid? SourceJobServerId { get; set; }
+    public string? SourceJobServerName { get; set; }
+    public IReadOnlyList<AppRoleAssignmentRow> Rows { get; set; } = Array.Empty<AppRoleAssignmentRow>();
+}
+
+/// <summary>One enterprise-app role assignment row from Graph appRoleAssignedTo.</summary>
+public class AppRoleAssignmentRow
+{
+    /// <summary>Graph appRoleAssignment id — the idempotency key. Required.</summary>
+    public string? AppRoleAssignmentId { get; set; }
+    /// <summary>Entra object id (GUID) of the principal (user/group/SP).</summary>
+    public string? PrincipalId { get; set; }
+    /// <summary>"User", "Group", or "ServicePrincipal".</summary>
+    public string? PrincipalType { get; set; }
+    public string? PrincipalDisplayName { get; set; }
+    /// <summary>Entra object id (GUID) of the resource service principal (the enterprise app).</summary>
+    public string? ResourceId { get; set; }
+    public string? ResourceDisplayName { get; set; }
+    /// <summary>App role GUID (Guid.Empty / null = default access).</summary>
+    public string? AppRoleId { get; set; }
+    public string? AppRoleName { get; set; }
+    public DateTime? CreatedDateTime { get; set; }
+}
+
+public class AppRoleAssignmentBulkResponse
+{
+    public Guid BatchId { get; set; }
+    public int PrincipalsResolved { get; set; }
+    public int PrincipalsUnresolved { get; set; }
+    public int AssignmentsPersisted { get; set; }
+}
