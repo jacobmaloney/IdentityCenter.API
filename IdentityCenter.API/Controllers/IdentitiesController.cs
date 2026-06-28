@@ -729,6 +729,10 @@ public class IdentitiesController : ControllerBase
 
         var results = new List<IdentityBulkUpsertResult>(request.Items.Count);
 
+        // ASSIGN-EXISTING-ONLY tag carry (Phase 2): (resolved IdentityId, caller tag names).
+        // Resolved to existing Tags.Id + upserted into IdentityTags after the row upserts.
+        var tagRows = new List<(Guid IdentityId, string[] TagNames)>();
+
         try
         {
             using var conn = new SqlConnection(_connectionString);
@@ -754,9 +758,22 @@ public class IdentitiesController : ControllerBase
                         $"SELECT TOP 1 Id FROM Identities WHERE [{keyColumn}] = @KeyValue ORDER BY CreatedAt ASC",
                         new { KeyValue = item.KeyValue });
 
-                    var outcome = existingId.HasValue
-                        ? await UpdateIdentityRowAsync(conn, existingId.Value, item, keyColumn)
-                        : await InsertIdentityRowAsync(conn, item, keyColumn);
+                    Guid resolvedId;
+                    string outcome;
+                    if (existingId.HasValue)
+                    {
+                        resolvedId = existingId.Value;
+                        outcome = await UpdateIdentityRowAsync(conn, resolvedId, item, keyColumn);
+                    }
+                    else
+                    {
+                        (outcome, resolvedId) = await InsertIdentityRowAsync(conn, item, keyColumn);
+                    }
+
+                    // Stage the resolved IdentityId + caller tag names; name→Tag resolution
+                    // + IdentityTags upsert happens once, set-based, after the loop.
+                    if (item.Tags is { Length: > 0 })
+                        tagRows.Add((resolvedId, item.Tags));
 
                     results.Add(new IdentityBulkUpsertResult { KeyValue = item.KeyValue, Outcome = outcome });
                 }
@@ -771,6 +788,13 @@ public class IdentitiesController : ControllerBase
                     });
                 }
             }
+
+            // ── ASSIGN-EXISTING-ONLY tag flush (Phase 2) ────────────────────
+            // Resolve every distinct caller-supplied tag NAME to an EXISTING Tags.Id
+            // (case-insensitive); skip + log unknown names (NEVER create a Tag); then
+            // idempotently upsert IdentityTags(IdentityId, TagId, IsInherited=1).
+            // Best-effort: a tag-flush failure never fails the identity upsert.
+            await UpsertIdentityTagsAsync(conn, tagRows, request.BatchId);
 
             _logger.LogInformation(
                 "API: identity bulk upsert batch {BatchId} on key '{KeyField}' processed {Total} ({Created} created, {Updated} updated, {Failed} failed)",
@@ -788,7 +812,7 @@ public class IdentitiesController : ControllerBase
         }
     }
 
-    private static async Task<string> InsertIdentityRowAsync(SqlConnection conn, IdentityBulkUpsertItem item, string keyColumn)
+    private static async Task<(string Outcome, Guid Id)> InsertIdentityRowAsync(SqlConnection conn, IdentityBulkUpsertItem item, string keyColumn)
     {
         var id = Guid.NewGuid();
         var (setCols, parameters) = BuildIdentityProjection(item.Attributes);
@@ -833,7 +857,7 @@ public class IdentitiesController : ControllerBase
 
         var sql = $"INSERT INTO Identities ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)})";
         await conn.ExecuteAsync(sql, parameters);
-        return "Created";
+        return ("Created", id);
     }
 
     private static async Task<string> UpdateIdentityRowAsync(SqlConnection conn, Guid existingId, IdentityBulkUpsertItem item, string keyColumn)
@@ -919,5 +943,114 @@ public class IdentitiesController : ControllerBase
         foreach (var (k, v) in attrs)
             if (string.Equals(k, key, StringComparison.OrdinalIgnoreCase)) return v;
         return null;
+    }
+
+    /// <summary>
+    /// ASSIGN-EXISTING-ONLY tag application for the Identities table (Phase 2 mirror of
+    /// <c>ObjectsController.UpsertObjectTagsAsync</c>). Resolves caller-supplied tag NAMES
+    /// to EXISTING <c>Tags</c> rows (case-insensitive) and idempotently upserts
+    /// <c>IdentityTags(IdentityId, TagId, IsInherited=1)</c>. Unknown names are SKIPPED and
+    /// logged — a Tag is NEVER created from caller input, honoring the locked product
+    /// decision and removing any new-vocabulary injection surface. Existing
+    /// (IdentityId, TagId) edges are left untouched (no duplicate rows). Best-effort:
+    /// a failure here is logged at Warning and never fails the identity upsert. Every
+    /// name flows as a typed @parameter or via SqlBulkCopy — no caller string is ever
+    /// concatenated into SQL text.
+    /// </summary>
+    private async Task UpsertIdentityTagsAsync(
+        SqlConnection conn,
+        List<(Guid IdentityId, string[] TagNames)> tagRows,
+        Guid batchId)
+    {
+        if (tagRows.Count == 0) return;
+        try
+        {
+            // Distinct, trimmed, non-empty names across the whole batch.
+            var requestedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (_, names) in tagRows)
+                foreach (var n in names)
+                    if (!string.IsNullOrWhiteSpace(n)) requestedNames.Add(n.Trim());
+            if (requestedNames.Count == 0) return;
+
+            // Resolve NAME → existing Tag Id. Parameterized list (Dapper expands @Names
+            // into a parameter per value — never string-concatenated). ASSIGN-EXISTING-ONLY:
+            // any name not returned here simply does not resolve and is skipped below.
+            var resolved = await conn.QueryAsync<TagIdName>(
+                "SELECT Id, Name FROM Tags WHERE Name IN @Names",
+                new { Names = requestedNames.ToArray() });
+
+            var nameToId = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in resolved)
+                if (!string.IsNullOrEmpty(r.Name)) nameToId[r.Name!] = r.Id;
+
+            // Log unknown names ONCE (don't create them).
+            var unknown = requestedNames.Where(n => !nameToId.ContainsKey(n)).ToList();
+            if (unknown.Count > 0)
+            {
+                _logger.LogWarning(
+                    "API: identity bulk upsert batch {BatchId} referenced {Count} unknown tag name(s) — skipped (assign-existing-only): {Names}",
+                    batchId, unknown.Count, string.Join(", ", unknown));
+            }
+
+            if (nameToId.Count == 0) return;
+
+            // Build the distinct (IdentityId, TagId) edge set in-memory.
+            var edges = new HashSet<(Guid, Guid)>();
+            foreach (var (identityId, names) in tagRows)
+                foreach (var n in names)
+                    if (!string.IsNullOrWhiteSpace(n) && nameToId.TryGetValue(n.Trim(), out var tagId))
+                        edges.Add((identityId, tagId));
+            if (edges.Count == 0) return;
+
+            // Stage the edges via typed SqlBulkCopy into a temp table, then a single
+            // INSERT ... WHERE NOT EXISTS for idempotency. No caller string ever enters
+            // SQL text — only typed Guid values flow through the bulk-copy.
+            await conn.ExecuteAsync(
+                "CREATE TABLE #StagingIdentityTags (IdentityId UNIQUEIDENTIFIER NOT NULL, TagId UNIQUEIDENTIFIER NOT NULL);");
+
+            using (var table = new System.Data.DataTable())
+            {
+                table.Columns.Add("IdentityId", typeof(Guid));
+                table.Columns.Add("TagId", typeof(Guid));
+                foreach (var (identityId, tagId) in edges)
+                    table.Rows.Add(identityId, tagId);
+
+                using var bulkCopy = new SqlBulkCopy(conn)
+                {
+                    DestinationTableName = "#StagingIdentityTags",
+                    BatchSize = 5000,
+                    BulkCopyTimeout = 120
+                };
+                bulkCopy.ColumnMappings.Add("IdentityId", "IdentityId");
+                bulkCopy.ColumnMappings.Add("TagId", "TagId");
+                await bulkCopy.WriteToServerAsync(table);
+            }
+
+            var inserted = await conn.ExecuteAsync(@"
+                INSERT INTO IdentityTags (Id, IdentityId, TagId, IsInherited, CreatedAt, CreatedBy)
+                SELECT NEWID(), s.IdentityId, s.TagId, 1, SYSUTCDATETIME(), 'Conduit-Bulk-API'
+                FROM #StagingIdentityTags s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM IdentityTags it
+                    WHERE it.IdentityId = s.IdentityId AND it.TagId = s.TagId);
+                DROP TABLE #StagingIdentityTags;", commandTimeout: 120);
+
+            _logger.LogInformation(
+                "API: identity bulk upsert batch {BatchId} applied {Inserted} new IdentityTag edge(s) across {Identities} identity(ies); {Resolved} tag name(s) resolved, {Unknown} skipped.",
+                batchId, inserted, tagRows.Count, nameToId.Count, unknown.Count);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort — the identity upsert is the contract; tags are enrichment.
+            _logger.LogWarning("Identity-tag upsert failed for batch {BatchId} ({Count} tagged identities, best-effort): {Error}",
+                batchId, tagRows.Count, ex.Message);
+        }
+    }
+
+    /// <summary>Dapper projection row for the Tag NAME→Id resolution query.</summary>
+    private sealed class TagIdName
+    {
+        public Guid Id { get; set; }
+        public string? Name { get; set; }
     }
 }

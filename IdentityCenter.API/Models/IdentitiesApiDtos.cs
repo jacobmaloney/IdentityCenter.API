@@ -97,6 +97,16 @@ public class IdentityBulkUpsertItem
     /// </summary>
     public IReadOnlyDictionary<string, string?> Attributes { get; set; } =
         new Dictionary<string, string?>();
+
+    /// <summary>
+    /// Tag NAMES to apply to this identity (e.g. ["Contractor"]). ASSIGN-EXISTING-ONLY:
+    /// IC resolves each name to an EXISTING <c>Tags</c> row (case-insensitive) and
+    /// upserts an <c>IdentityTags</c> row (IsInherited=1). Unknown names are SKIPPED and
+    /// logged — IC NEVER creates a Tag from caller input. Null/empty applies no tags
+    /// (and never removes existing tags — this is additive/idempotent only). Mirrors
+    /// <c>BulkUpsertItem.Tags</c> on the Objects path (Phase 2 tag carry-through).
+    /// </summary>
+    public string[]? Tags { get; set; }
 }
 
 public class IdentityBulkUpsertResponse

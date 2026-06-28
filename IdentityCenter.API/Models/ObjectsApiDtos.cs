@@ -32,6 +32,13 @@ public class ObjectQueryItem
     public DateTime ModifiedAt { get; set; }
     public IReadOnlyDictionary<string, string?> Attributes { get; set; } =
         new Dictionary<string, string?>();
+
+    /// <summary>
+    /// Names of the Tags currently applied to this object (via ObjectTags). Surfaced so
+    /// a Conduit Objects→Identities sync can carry the object's tags through to the
+    /// Identity (Phase 2 tag carry-through). Empty when the object has no tags.
+    /// </summary>
+    public IReadOnlyList<string> Tags { get; set; } = Array.Empty<string>();
 }
 
 /// <summary>

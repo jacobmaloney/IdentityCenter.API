@@ -200,6 +200,31 @@ public class ObjectsController : ControllerBase
                 {
                     item.Attributes = byObject[item.Id];
                 }
+
+                // Hydrate the page's ObjectTags → tag NAMES in one round-trip so a
+                // Conduit Objects→Identities sync can carry each object's tags through to
+                // the Identity (Phase 2 tag carry-through). Read-only join; no caller
+                // input enters SQL — only the typed @ids list.
+                var tagRows = await conn.QueryAsync<(Guid ObjectId, string Name)>(
+                    @"SELECT ot.ObjectId, t.Name
+                      FROM ObjectTags ot
+                      INNER JOIN Tags t ON t.Id = ot.TagId
+                      WHERE ot.ObjectId IN @ids",
+                    new { ids });
+
+                var tagsByObject = new Dictionary<Guid, List<string>>();
+                foreach (var tr in tagRows)
+                {
+                    if (string.IsNullOrEmpty(tr.Name)) continue;
+                    if (!tagsByObject.TryGetValue(tr.ObjectId, out var list))
+                        tagsByObject[tr.ObjectId] = list = new List<string>();
+                    list.Add(tr.Name);
+                }
+                foreach (var item in items)
+                {
+                    if (tagsByObject.TryGetValue(item.Id, out var names))
+                        item.Tags = names;
+                }
             }
 
             return Ok(new ObjectQueryResponse
