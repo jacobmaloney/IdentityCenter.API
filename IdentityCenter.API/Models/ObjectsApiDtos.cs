@@ -65,6 +65,14 @@ public class BulkUpsertItem
     /// leaves the IC column NULL — pre-V126 callers don't need to set this.
     /// </summary>
     public string? OriginalSource { get; set; }
+    /// <summary>
+    /// Tag NAMES to apply to this object (e.g. ["Contractor"]). ASSIGN-EXISTING-ONLY:
+    /// IC resolves each name to an EXISTING <c>Tags</c> row (case-insensitive) and
+    /// upserts an <c>ObjectTags</c> row (IsInherited=1). Unknown names are SKIPPED and
+    /// logged — IC NEVER creates a Tag from caller input. Null/empty applies no tags
+    /// (and never removes existing tags — this is additive/idempotent only).
+    /// </summary>
+    public string[]? Tags { get; set; }
     public IReadOnlyDictionary<string, string?> Attributes { get; set; } =
         new Dictionary<string, string?>();
 }

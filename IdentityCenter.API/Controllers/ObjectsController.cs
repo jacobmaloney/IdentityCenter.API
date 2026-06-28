@@ -420,6 +420,9 @@ public class ObjectsController : ControllerBase
 
             var attrRows = new List<(Guid ObjectId, string AttributeName, string? AttributeValue, string? DataType)>();
             var auditRows = new List<(Guid ObjectId, int OperationType, string NewValue)>();
+            // ASSIGN-EXISTING-ONLY tag carry: (resolved ObjectId, caller-supplied tag names).
+            // Resolved to existing Tags.Id + upserted into ObjectTags after the audit flush.
+            var tagRows = new List<(Guid ObjectId, string[] TagNames)>();
 
             // Stage 2/3 — SqlBulkCopy + MERGE Objects, then read the OUTPUT back to
             // derive per-item outcome + the ObjectId for EVERY row (new and existing).
@@ -493,6 +496,11 @@ public class ObjectsController : ControllerBase
                     // batched set-based flush below. ObjectId comes from the MERGE OUTPUT,
                     // so NEW objects get their attributes too.
                     CollectAttributes(attrRows, objectId, item.Attributes);
+                    // ASSIGN-EXISTING-ONLY tags: stage the resolved ObjectId + the caller's
+                    // tag names. Name→Tag resolution + ObjectTags upsert happens once,
+                    // set-based, after the audit flush (unknown names skipped + logged there).
+                    if (item.Tags is { Length: > 0 })
+                        tagRows.Add((objectId, item.Tags));
                     auditRows.Add((objectId,
                         string.Equals(auditAction, "Created", StringComparison.OrdinalIgnoreCase) ? 0 : 1,
                         JsonSerializer.Serialize(new
@@ -532,6 +540,16 @@ public class ObjectsController : ControllerBase
             await FlushAuditAsync(conn, auditRows);
             _logger.LogDebug("PERF: (h) audit insert {Ms}ms ({Rows} audit rows, batch {BatchId})",
                 swPhase.ElapsedMilliseconds, auditRows.Count, request.BatchId);
+
+            // ── ASSIGN-EXISTING-ONLY tag flush ──────────────────────────────
+            // Resolve every distinct caller-supplied tag NAME to an EXISTING Tags.Id
+            // (case-insensitive); skip + log unknown names (NEVER create a Tag); then
+            // idempotently upsert ObjectTags(ObjectId, TagId, IsInherited=1). Best-effort:
+            // a tag-flush failure never fails the object upsert (objects are the contract).
+            swPhase.Restart();
+            await UpsertObjectTagsAsync(conn, tagRows, request.BatchId);
+            _logger.LogDebug("PERF: (i) object-tags upsert {Ms}ms ({Rows} tagged objects, batch {BatchId})",
+                swPhase.ElapsedMilliseconds, tagRows.Count, request.BatchId);
 
             _logger.LogDebug("PERF: TOTAL BulkUpsert {Ms}ms ({Items} items, batch {BatchId})",
                 swTotal.ElapsedMilliseconds, request.Items.Count, request.BatchId);
@@ -1000,6 +1018,114 @@ public class ObjectsController : ControllerBase
             // didn't land. Log at Warning so a future schema divergence is visible.
             _logger.LogWarning("Batched audit write failed for {Count} rows (best-effort): {Error}", auditRows.Count, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// ASSIGN-EXISTING-ONLY tag application. Resolves caller-supplied tag NAMES to
+    /// EXISTING <c>Tags</c> rows (case-insensitive) and idempotently upserts
+    /// <c>ObjectTags(ObjectId, TagId, IsInherited=1)</c>. Unknown names are SKIPPED and
+    /// logged — a Tag is NEVER created from caller input, which both honors the locked
+    /// product decision and removes any injection-of-new-vocabulary surface. Existing
+    /// (ObjectId, TagId) edges are left untouched (no duplicate rows). Best-effort:
+    /// a failure here is logged at Warning and never fails the object upsert.
+    /// </summary>
+    private async Task UpsertObjectTagsAsync(
+        SqlConnection conn,
+        List<(Guid ObjectId, string[] TagNames)> tagRows,
+        Guid batchId)
+    {
+        if (tagRows.Count == 0) return;
+        try
+        {
+            // Distinct, trimmed, non-empty names across the whole batch.
+            var requestedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (_, names) in tagRows)
+                foreach (var n in names)
+                    if (!string.IsNullOrWhiteSpace(n)) requestedNames.Add(n.Trim());
+            if (requestedNames.Count == 0) return;
+
+            // Resolve NAME → existing Tag Id. Parameterized list (Dapper expands @Names
+            // into a parameter per value — never string-concatenated). ASSIGN-EXISTING-ONLY:
+            // any name not returned here simply does not resolve and is skipped below.
+            var resolved = await conn.QueryAsync<TagIdName>(
+                "SELECT Id, Name FROM Tags WHERE Name IN @Names",
+                new { Names = requestedNames.ToArray() });
+
+            var nameToId = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in resolved)
+                if (!string.IsNullOrEmpty(r.Name)) nameToId[r.Name!] = r.Id;
+
+            // Log unknown names ONCE (don't create them).
+            var unknown = requestedNames.Where(n => !nameToId.ContainsKey(n)).ToList();
+            if (unknown.Count > 0)
+            {
+                _logger.LogWarning(
+                    "API: bulk upsert batch {BatchId} referenced {Count} unknown tag name(s) — skipped (assign-existing-only): {Names}",
+                    batchId, unknown.Count, string.Join(", ", unknown));
+            }
+
+            if (nameToId.Count == 0) return;
+
+            // Build the distinct (ObjectId, TagId) edge set in-memory.
+            var edges = new HashSet<(Guid, Guid)>();
+            foreach (var (objectId, names) in tagRows)
+                foreach (var n in names)
+                    if (!string.IsNullOrWhiteSpace(n) && nameToId.TryGetValue(n.Trim(), out var tagId))
+                        edges.Add((objectId, tagId));
+            if (edges.Count == 0) return;
+
+            // Stage the edges via typed SqlBulkCopy into a temp table, then a single
+            // INSERT ... WHERE NOT EXISTS for idempotency. No caller string ever enters
+            // SQL text — only typed Guid values flow through the bulk-copy.
+            await conn.ExecuteAsync(
+                "CREATE TABLE #StagingObjectTags (ObjectId UNIQUEIDENTIFIER NOT NULL, TagId UNIQUEIDENTIFIER NOT NULL);");
+
+            using (var table = new DataTable())
+            {
+                table.Columns.Add("ObjectId", typeof(Guid));
+                table.Columns.Add("TagId", typeof(Guid));
+                foreach (var (objectId, tagId) in edges)
+                    table.Rows.Add(objectId, tagId);
+
+                using var bulkCopy = new SqlBulkCopy(conn)
+                {
+                    DestinationTableName = "#StagingObjectTags",
+                    BatchSize = 5000,
+                    BulkCopyTimeout = 120
+                };
+                bulkCopy.ColumnMappings.Add("ObjectId", "ObjectId");
+                bulkCopy.ColumnMappings.Add("TagId", "TagId");
+                await bulkCopy.WriteToServerAsync(table);
+            }
+
+            var inserted = await conn.ExecuteAsync(@"
+                INSERT INTO ObjectTags (Id, ObjectId, TagId, IsInherited, CreatedAt, CreatedBy)
+                SELECT NEWID(), s.ObjectId, s.TagId, 1, SYSUTCDATETIME(), 'Conduit-Bulk-API'
+                FROM #StagingObjectTags s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM ObjectTags ot
+                    WHERE ot.ObjectId = s.ObjectId AND ot.TagId = s.TagId);
+                DROP TABLE #StagingObjectTags;", commandTimeout: 120);
+
+            _logger.LogInformation(
+                "API: bulk upsert batch {BatchId} applied {Inserted} new ObjectTag edge(s) across {Objects} object(s); {Resolved} tag name(s) resolved, {Unknown} skipped.",
+                batchId, inserted, tagRows.Count, nameToId.Count, unknown.Count);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort, exactly like the audit flush — the object upsert is the
+            // contract; tags are an enrichment. Surface at Warning so a schema/seed
+            // divergence is visible without failing real directory data.
+            _logger.LogWarning("Object-tag upsert failed for batch {BatchId} ({Count} tagged objects, best-effort): {Error}",
+                batchId, tagRows.Count, ex.Message);
+        }
+    }
+
+    /// <summary>Dapper projection row for the Tag NAME→Id resolution query.</summary>
+    private sealed class TagIdName
+    {
+        public Guid Id { get; set; }
+        public string? Name { get; set; }
     }
 
     private static string? LookupAttr(IReadOnlyDictionary<string, string?> attrs, string key)
