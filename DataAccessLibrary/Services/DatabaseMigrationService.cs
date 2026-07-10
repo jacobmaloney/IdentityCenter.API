@@ -18,8 +18,13 @@ public class DatabaseMigrationService
 {
     private string _connectionString;
     private readonly ILogger<DatabaseMigrationService> _logger;
+    private readonly bool _failOnChecksumMismatch;
 
     private const string SchemaVersionTableName = "__SchemaVersion";
+
+    // When true (default) a checksum mismatch on an already-applied migration halts startup;
+    // an operator can downgrade fail->warn by setting this to false if a mismatch is known-benign.
+    private const string ChecksumFailOnMismatchKey = "Migrations:ChecksumValidation:FailOnMismatch";
 
     public DatabaseMigrationService(
         IConfiguration configuration,
@@ -28,6 +33,7 @@ public class DatabaseMigrationService
         _connectionString = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("DefaultConnection not found in configuration");
         _logger = logger;
+        _failOnChecksumMismatch = configuration.GetValue<bool?>(ChecksumFailOnMismatchKey) ?? true;
     }
 
     /// <summary>
@@ -121,6 +127,8 @@ public class DatabaseMigrationService
             currentVersion, allScripts.Count,
             string.Join(", ", allScripts.Select(s => $"V{s.Version:D3}")));
 
+        await ValidateAppliedChecksumsAsync(conn, allScripts, currentVersion);
+
         var scripts = GetPendingScripts(currentVersion);
         if (!scripts.Any())
         {
@@ -202,6 +210,89 @@ public class DatabaseMigrationService
     public List<MigrationScript> GetAllScripts()
     {
         return LoadEmbeddedScripts();
+    }
+
+    /// <summary>
+    /// Validates that already-applied migrations (Version &lt;= currentVersion) still match the
+    /// embedded script content they were applied from. The run-decision logic remains purely
+    /// version-based; this is an integrity check alongside it. On mismatch we fail closed by
+    /// default (throw + halt startup), or log a warning when <see cref="ChecksumFailOnMismatchKey"/>
+    /// is set to false.
+    /// </summary>
+    private async Task ValidateAppliedChecksumsAsync(SqlConnection conn, List<MigrationScript> allScripts, int currentVersion)
+    {
+        var applied = (await conn.QueryAsync<AppliedMigration>(
+            $@"SELECT Version, AppliedAt, ScriptName, Checksum
+               FROM {SchemaVersionTableName}
+               WHERE Version <= @CurrentVersion
+               ORDER BY Version",
+            new { CurrentVersion = currentVersion })).ToList();
+
+        var findings = EvaluateAppliedChecksums(applied, allScripts);
+
+        // Log first so the operator always gets the actionable line, then enforce the fail-closed policy.
+        foreach (var finding in findings)
+        {
+            if (finding.Kind == ChecksumFindingKind.Drift && _failOnChecksumMismatch)
+                _logger.LogError(finding.Message);
+            else
+                _logger.LogWarning(finding.Message);
+        }
+
+        EnforceFailClosedPolicy(findings, _failOnChecksumMismatch);
+    }
+
+    /// <summary>
+    /// Applies the fail-closed policy to classified findings: throws on the first drift finding when
+    /// <paramref name="failOnMismatch"/> is true, otherwise returns without throwing. Pure and
+    /// side-effect-free so both the halt and the downgraded-to-warning paths are directly testable.
+    /// </summary>
+    internal static void EnforceFailClosedPolicy(IEnumerable<ChecksumFinding> findings, bool failOnMismatch)
+    {
+        if (!failOnMismatch)
+            return;
+
+        var drift = findings.FirstOrDefault(f => f.Kind == ChecksumFindingKind.Drift);
+        if (drift is not null)
+            throw new InvalidOperationException(drift.Message);
+    }
+
+    /// <summary>
+    /// Pure, side-effect-free classification of already-applied migrations against the embedded
+    /// scripts: emits a Drift finding when a stored checksum no longer matches its embedded script,
+    /// and an UnknownApplied finding when an applied row has no matching embedded script. Rows with a
+    /// NULL/empty stored checksum (pre-dating the Checksum column) are skipped. The caller applies the
+    /// fail-closed policy; keeping this method free of DB access and logging makes it directly testable.
+    /// </summary>
+    internal static List<ChecksumFinding> EvaluateAppliedChecksums(
+        IEnumerable<AppliedMigration> appliedRows,
+        IEnumerable<MigrationScript> embeddedScripts)
+    {
+        var findings = new List<ChecksumFinding>();
+        var scriptsByVersion = embeddedScripts.ToDictionary(s => s.Version);
+
+        foreach (var row in appliedRows)
+        {
+            if (string.IsNullOrWhiteSpace(row.Checksum))
+                continue;
+
+            if (!scriptsByVersion.TryGetValue(row.Version, out var script))
+            {
+                findings.Add(new ChecksumFinding(
+                    ChecksumFindingKind.UnknownApplied, row.Version, row.ScriptName,
+                    $"Applied migration V{row.Version} ({row.ScriptName}) has no matching embedded script — unknown applied migration; skipping integrity check"));
+                continue;
+            }
+
+            if (!string.Equals(row.Checksum, script.Checksum, StringComparison.OrdinalIgnoreCase))
+            {
+                findings.Add(new ChecksumFinding(
+                    ChecksumFindingKind.Drift, script.Version, script.ScriptName,
+                    $"Migration V{script.Version} ({script.ScriptName}): applied migration content has changed since it was applied (schema drift) — investigate before starting."));
+            }
+        }
+
+        return findings;
     }
 
     private async Task EnsureSchemaVersionTableAsync(SqlConnection conn)
@@ -318,3 +409,11 @@ public class AppliedMigration
     public string ScriptName { get; set; } = "";
     public string? Checksum { get; set; }
 }
+
+internal enum ChecksumFindingKind
+{
+    Drift,
+    UnknownApplied
+}
+
+internal sealed record ChecksumFinding(ChecksumFindingKind Kind, int Version, string ScriptName, string Message);
