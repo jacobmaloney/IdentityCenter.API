@@ -141,10 +141,6 @@ public class ApiKeyAuthenticationHandler : AuthenticationHandler<ApiKeyAuthentic
     /// </summary>
     private AuthenticateResult SucceedControlPlane(TenantApiKeyValidationResult cp)
     {
-        // Authorization scope claim. Control-plane Admin ⇒ "admin" (satisfies AdminPolicy). Tenant ⇒
-        // "tenant" (satisfies TenantPolicy; deliberately does NOT satisfy AdminPolicy → 403 on /provision).
-        var scopeClaim = cp.Scope == TenantApiKeyScope.Admin ? "admin" : "tenant";
-
         // NOTE (Day-6 fix): we deliberately do NOT set ITenantContext or TenantConnectionAccessor here.
         // This handler runs as an awaited SUBTREE of the authorization middleware, and an AsyncLocal set
         // inside an awaited callee does not flow back up to the caller — so any value set here would be
@@ -152,20 +148,10 @@ public class ApiKeyAuthenticationHandler : AuthenticationHandler<ApiKeyAuthentic
         // tenant routing is installed instead by TenantConnectionScopeMiddleware, which runs as an ANCESTOR
         // frame of the controller and reads the SAME trust anchor: the server-set claims below, derived
         // here from the validated key row. The key_type + tenant_id claims are the contract between the two.
-
-        var claims = new List<Claim>
-        {
-            new Claim(ClaimTypes.NameIdentifier, cp.KeyId.ToString()),
-            new Claim(ClaimTypes.Name, cp.Name ?? "Control-plane key"),
-            new Claim("key_type", cp.Scope == TenantApiKeyScope.Admin ? "ControlPlaneAdmin" : "Tenant"),
-            new Claim("scope", scopeClaim),
-        };
-
-        // tenant_id is AUDIT METADATA ONLY. It is never read back to select a database — the connection
-        // is driven exclusively by ITenantContext (set above from the validated row). Emitting it as a
-        // claim lets controllers/audit see who they served without reopening an IDOR vector.
-        if (cp.TenantId is Guid tid)
-            claims.Add(new Claim("tenant_id", tid.ToString()));
+        //
+        // The scope→claims mapping (Admin/Tenant/Agent) lives in ControlPlaneClaims so it stays a pure,
+        // tested function. tenant_id is server-set from the validated key row — never client-supplied.
+        var claims = ControlPlaneClaims.Build(cp);
 
         var identity = new ClaimsIdentity(claims, Scheme.Name);
         var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name);

@@ -8,6 +8,20 @@ namespace IdentityCenter.API.Authentication;
 /// direct connection, so it is honored ONLY when the remote socket address is in
 /// the configured trusted-proxy list (Api:TrustedProxies, an array of IPs).
 /// Default (empty list) = always the socket address.
+///
+/// RIGHTMOST semantics (HIGH-2; the "rightmost" fix DAY5 B4 deferred): when the remote IS a
+/// trusted proxy, only the RIGHTMOST entry of the LAST X-Forwarded-For header line is honored.
+/// An append-only edge (Azure App Service front end, Front Door, App Gateway) appends the peer
+/// it actually saw as the rightmost entry of the header it forwards — every token to its left,
+/// and every earlier header line, passed through from the client verbatim and is spoofable.
+/// Taking the leftmost entry (pre-2026-07-10) meant a caller who sent its own X-Forwarded-For
+/// chose its resolved IP the moment Api:TrustedProxies was populated — fully spoofable rate
+/// limiters and audit IPs. An unparseable rightmost token fails SAFE to the socket address; a
+/// leftward token is never consulted.
+///
+/// FORK NOTE: in the IdentityCenter repo this type lives in DataAccessLibrary.Security (shared
+/// with WebPortal callers). The fork has no portal, so it stays here — namespace only; the
+/// behavior mirrors main's 16c3850d byte-for-byte.
 /// </summary>
 public static class ClientIp
 {
@@ -29,11 +43,25 @@ public static class ClientIp
         if (!remoteIsTrusted)
             return socketAddress;
 
-        var forwardedFor = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (string.IsNullOrEmpty(forwardedFor))
+        // LAST header line: a client can send its own X-Forwarded-For header; an edge that adds
+        // a separate header line (rather than comma-appending) always adds it after the client's.
+        var headerLines = context.Request.Headers["X-Forwarded-For"];
+        var lastLine = headerLines.Count > 0 ? headerLines[headerLines.Count - 1] : null;
+        if (string.IsNullOrEmpty(lastLine))
             return socketAddress;
 
-        var first = forwardedFor.Split(',')[0].Trim();
-        return IPAddress.TryParse(first, out var forwarded) ? forwarded.ToString() : socketAddress;
+        // RIGHTMOST token = the one entry the trusted peer itself appended (the address it saw).
+        var tokens = lastLine.Split(',');
+        var rightmost = tokens[tokens.Length - 1].Trim();
+
+        // The App Service front end appends "ip:port" — parse as an endpoint (the same shape
+        // ASP.NET's ForwardedHeadersMiddleware accepts; bare addresses parse with port 0).
+        if (!IPEndPoint.TryParse(rightmost, out var forwarded))
+            return socketAddress;
+
+        var address = forwarded.Address.IsIPv4MappedToIPv6
+            ? forwarded.Address.MapToIPv4()
+            : forwarded.Address;
+        return address.ToString();
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using IdentityCenter.API.Authentication;
 
 namespace IdentityCenter.API.Middleware;
 
@@ -17,6 +18,7 @@ public class RateLimitingMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<RateLimitingMiddleware> _logger;
+    private readonly IConfiguration _configuration;
 
     // Sliding window tracking: key -> list of request timestamps
     private static readonly ConcurrentDictionary<string, SlidingWindow> _requestWindows = new();
@@ -33,10 +35,11 @@ public class RateLimitingMiddleware
     private const int AnonymousRateLimit = 30;
     private const int WindowSizeSeconds = 60;
 
-    public RateLimitingMiddleware(RequestDelegate next, ILogger<RateLimitingMiddleware> logger)
+    public RateLimitingMiddleware(RequestDelegate next, ILogger<RateLimitingMiddleware> logger, IConfiguration configuration)
     {
         _next = next;
         _logger = logger;
+        _configuration = configuration;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -54,7 +57,7 @@ public class RateLimitingMiddleware
             return;
         }
 
-        var clientKey = GetClientKey(context);
+        var clientKey = GetClientKey(context, _configuration);
         var rateLimit = GetRateLimit(context);
 
         EvictIdleWindows();
@@ -125,7 +128,13 @@ public class RateLimitingMiddleware
         }
     }
 
-    private static string GetClientKey(HttpContext context)
+    /// <summary>
+    /// Authenticated callers key on the API key id. Anonymous callers key on the TRUST-AWARE
+    /// client IP (ClientIp.Resolve, Day 5): with Api:TrustedProxies unset (every on-prem box)
+    /// that is the socket address — a spoofed X-Forwarded-For can no longer mint unlimited
+    /// fresh anonymous rate-limit identities. Public static for unit tests.
+    /// </summary>
+    public static string GetClientKey(HttpContext context, IConfiguration configuration)
     {
         // Use API key ID if authenticated, otherwise use IP
         var keyId = context.User?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
@@ -134,13 +143,7 @@ public class RateLimitingMiddleware
             return $"key:{keyId}";
         }
 
-        // Fall back to IP address
-        var forwardedFor = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        var ip = !string.IsNullOrEmpty(forwardedFor)
-            ? forwardedFor.Split(',')[0].Trim()
-            : context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-
-        return $"ip:{ip}";
+        return $"ip:{ClientIp.Resolve(context, configuration)}";
     }
 
     private static int GetRateLimit(HttpContext context)

@@ -202,6 +202,16 @@ WHERE Id = @Id",
             new { Id = id, Status = status.ToString(), ModifiedAt = DateTime.UtcNow }).ConfigureAwait(false);
     }
 
+    public async Task<TenantStatus?> GetStatusAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        var raw = await conn.ExecuteScalarAsync<string?>(
+            "SELECT Status FROM Tenants WHERE Id = @Id", new { Id = id }).ConfigureAwait(false);
+        if (raw is null) return null;
+        return Enum.TryParse<TenantStatus>(raw, ignoreCase: true, out var s) ? s : TenantStatus.Failed;
+    }
+
     public async Task SetConnectionStringAsync(Guid id, string plaintextConnectionString, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(plaintextConnectionString))

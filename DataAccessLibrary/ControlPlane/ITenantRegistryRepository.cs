@@ -31,6 +31,12 @@ public interface ITenantRegistryRepository
     /// <summary>Sets the tenant status only (e.g. Provisioning → Active/Failed).</summary>
     Task SetStatusAsync(Guid id, TenantStatus status, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Lightweight status-only read (no secret decryption). Null when the tenant does not exist.
+    /// Used by the per-request suspension gate, which runs on every tenant-key request.
+    /// </summary>
+    Task<TenantStatus?> GetStatusAsync(Guid id, CancellationToken cancellationToken = default);
+
     /// <summary>Encrypts and stores the tenant DB connection string.</summary>
     Task SetConnectionStringAsync(Guid id, string plaintextConnectionString, CancellationToken cancellationToken = default);
 

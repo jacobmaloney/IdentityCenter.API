@@ -134,6 +134,13 @@ builder.Services.AddSingleton<ControlPlaneMigrationService>();
 // ── SaaS Day 4: per-tenant request resolution + tenant-scoped keys ───────────
 // Control-plane API-key authority (resolves a key → {TenantId, Scope} BEFORE any tenant DB is opened).
 builder.Services.AddScoped<ITenantApiKeyRepository, TenantApiKeyRepository>();
+// Day 4 enroll (POST /api/agent/enroll): single-use enroll codes + append-only control-plane audit
+// + the dedicated per-IP enroll limiter (singleton — one sliding window across all requests).
+builder.Services.AddScoped<IEnrollCodeRepository, EnrollCodeRepository>();
+builder.Services.AddScoped<IControlPlaneAuditRepository, ControlPlaneAuditRepository>();
+builder.Services.AddSingleton<IdentityCenter.API.Services.Enroll.EnrollRateLimiter>();
+// Per-node 60s TTL cache backing the tenant-suspension gate in TenantConnectionScopeMiddleware.
+builder.Services.AddSingleton<TenantStatusCache>();
 // ITenantContext is AsyncLocal-backed; SINGLETON is correct (the AsyncLocal isolates per request flow).
 builder.Services.AddSingleton<ITenantContext, AsyncLocalTenantContext>();
 // Per-request connection resolver (memoizes per scope). SCOPED so it sees this request's tenant context.

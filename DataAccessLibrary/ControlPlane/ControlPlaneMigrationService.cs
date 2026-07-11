@@ -48,6 +48,9 @@ public sealed class ControlPlaneMigrationService
         await EnsureTenantsTableAsync(cancellationToken).ConfigureAwait(false);
         await EnsureTenantsColumnsAsync(cancellationToken).ConfigureAwait(false);
         await EnsureTenantApiKeysTableAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureTenantApiKeysColumnsAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureEnrollCodesTableAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureControlPlaneAuditLogTableAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureDatabaseExistsAsync(CancellationToken cancellationToken)
@@ -184,5 +187,106 @@ END
 ", commandTimeout: 120).ConfigureAwait(false);
 
         _logger.LogInformation("Control-plane TenantApiKeys table verified/created");
+    }
+
+    /// <summary>
+    /// Idempotent column-level migration for TenantApiKeys (registries created before a column was
+    /// introduced). Same pattern as <see cref="EnsureTenantsColumnsAsync"/>: guarded, nullable, safe on
+    /// every startup. AgentId carries the Conduit instance GUID for Scope='Agent' keys (Day 4 enroll) —
+    /// NULL for Admin/Tenant keys. Scope='Agent' itself needs no DDL (Scope is already NVARCHAR(16)).
+    /// </summary>
+    private async Task EnsureTenantApiKeysColumnsAsync(CancellationToken cancellationToken)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await conn.ExecuteAsync(@"
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'TenantApiKeys' AND COLUMN_NAME = 'AgentId')
+BEGIN
+    ALTER TABLE TenantApiKeys ADD AgentId UNIQUEIDENTIFIER NULL;
+END
+", commandTimeout: 120).ConfigureAwait(false);
+
+        // ExpiresAt (Day 5): optional key expiry. NULL = non-expiring — every key minted before
+        // this column existed keeps working forever (grandfathered). Expiry only ever comes from
+        // an explicit TTL at mint time, the ControlPlane:ApiKeyDefaultTtlDays config, or a
+        // rotation grace stamp.
+        await conn.ExecuteAsync(@"
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'TenantApiKeys' AND COLUMN_NAME = 'ExpiresAt')
+BEGIN
+    ALTER TABLE TenantApiKeys ADD ExpiresAt DATETIME2 NULL;
+END
+", commandTimeout: 120).ConfigureAwait(false);
+
+        _logger.LogInformation("Control-plane TenantApiKeys columns verified (AgentId, ExpiresAt)");
+    }
+
+    /// <summary>
+    /// Idempotent DDL for the <c>EnrollCodes</c> table — single-use, short-TTL agent enrollment codes
+    /// (Day 4: POST /api/agent/enroll). A code is minted by a tenant admin in the portal, stored as its
+    /// SHA-256 hex only (same scheme as TenantApiKeys), and consumed atomically exactly once by
+    /// <see cref="EnrollCodeRepository.TryConsumeAsync"/>. ON DELETE CASCADE: codes are worthless once
+    /// the tenant is gone.
+    /// </summary>
+    private async Task EnsureEnrollCodesTableAsync(CancellationToken cancellationToken)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await conn.ExecuteAsync(@"
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'EnrollCodes')
+BEGIN
+    CREATE TABLE EnrollCodes (
+        Id               UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_EnrollCodes PRIMARY KEY,
+        TenantId         UNIQUEIDENTIFIER NOT NULL,
+        CodeHash         NVARCHAR(128)    NOT NULL, -- SHA-256 hex (lowercase) of the normalized code; raw never stored
+        ExpiresAt        DATETIME2        NOT NULL,
+        UsedAt           DATETIME2        NULL,     -- single-use stamp; NULL = unconsumed
+        UsedByInstanceId UNIQUEIDENTIFIER NULL,
+        CreatedAt        DATETIME2        NOT NULL CONSTRAINT DF_EnrollCodes_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy        NVARCHAR(256)    NULL,
+        CONSTRAINT FK_EnrollCodes_Tenants FOREIGN KEY (TenantId)
+            REFERENCES Tenants (Id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IX_EnrollCodes_CodeHash ON EnrollCodes (CodeHash);
+END
+", commandTimeout: 120).ConfigureAwait(false);
+
+        _logger.LogInformation("Control-plane EnrollCodes table verified/created");
+    }
+
+    /// <summary>
+    /// Idempotent DDL for the <c>ControlPlaneAuditLog</c> table — append-only trail for control-plane
+    /// actions (enrollment, key mgmt, suspend/resume/delete). Detail must never contain secrets.
+    /// </summary>
+    private async Task EnsureControlPlaneAuditLogTableAsync(CancellationToken cancellationToken)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await conn.ExecuteAsync(@"
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'ControlPlaneAuditLog')
+BEGIN
+    CREATE TABLE ControlPlaneAuditLog (
+        Id        BIGINT           NOT NULL IDENTITY(1,1) CONSTRAINT PK_ControlPlaneAuditLog PRIMARY KEY,
+        At        DATETIME2        NOT NULL CONSTRAINT DF_ControlPlaneAuditLog_At DEFAULT SYSUTCDATETIME(),
+        Actor     NVARCHAR(256)    NOT NULL, -- API-key name/prefix or 'agent-enroll'
+        Action    NVARCHAR(64)     NOT NULL,
+        TenantId  UNIQUEIDENTIFIER NULL,
+        Slug      NVARCHAR(40)     NULL,
+        ClientIp  NVARCHAR(64)     NULL,
+        Detail    NVARCHAR(MAX)    NULL
+    );
+
+    CREATE INDEX IX_ControlPlaneAuditLog_TenantId_At ON ControlPlaneAuditLog (TenantId, At);
+END
+", commandTimeout: 120).ConfigureAwait(false);
+
+        _logger.LogInformation("Control-plane ControlPlaneAuditLog table verified/created");
     }
 }
