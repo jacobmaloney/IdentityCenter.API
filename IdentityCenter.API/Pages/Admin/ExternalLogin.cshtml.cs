@@ -182,6 +182,28 @@ public class ExternalLoginModel : PageModel
             return RedirectToPage("./Login");
         }
 
+        // Same stale-local-password bypass fix as the WebPortal ExternalLogin (V155 sweeps this
+        // historically; this closes the regeneration path): an account that keeps a local password
+        // while it now authenticates through a central IdP leaves that password as a live bypass of
+        // central login. Drop it the moment the identity is linked. FAIL CLOSED on a drop failure —
+        // revert the just-added login and abort rather than mint an admin cookie over a surviving hash.
+        if (await _userManager.HasPasswordAsync(existingUser))
+        {
+            var dropResult = await _userManager.RemovePasswordAsync(existingUser);
+            if (!dropResult.Succeeded)
+            {
+                _logger.LogError("Admin UI: failed to remove residual local password for {UserId} on external-login link; reverting link: {Errors}",
+                    existingUser.Id, string.Join(", ", dropResult.Errors.Select(e => e.Description)));
+                var revert = await _userManager.RemoveLoginAsync(existingUser, info.LoginProvider, info.ProviderKey);
+                if (!revert.Succeeded)
+                    _logger.LogError("Admin UI: failed to revert external-login link for {UserId} after password-drop failure: {Errors}",
+                        existingUser.Id, string.Join(", ", revert.Errors.Select(e => e.Description)));
+                await SignOutExternalAsync();
+                ErrorMessage = "We couldn't finish linking your account securely. Please try signing in again.";
+                return RedirectToPage("./Login");
+            }
+        }
+
         await _signInManager.SignInAsync(existingUser, isPersistent: false);
         return await CompleteAdminSignInAsync(existingUser, info, returnUrl);
     }
