@@ -838,7 +838,7 @@ public class InternalSyncStepExecutor : IInternalSyncStepExecutor
 
             try
             {
-                var fieldName = mapping.TargetField;
+                var fieldName = ValidateObjectColumn(mapping.TargetField);
                 var sql = string.Concat(
                     "INSERT INTO FieldLookupValues (Id, FieldName, Value, SortOrder, IsActive, CreatedAt) ",
                     "SELECT NEWID(), @FieldName, src.val, 0, 1, GETUTCDATE() ",
