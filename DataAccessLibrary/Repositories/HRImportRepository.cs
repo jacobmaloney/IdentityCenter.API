@@ -202,6 +202,15 @@ public class HRImportRepository : DapperRepositoryBase, IHRImportRepository
             // Normalize uniqueIdField: "Employee ID" → "EmployeeId", "first_name" → "FirstName"
             uniqueIdField = NormalizeToColumnName(uniqueIdField, validColumns);
 
+            // The unique-ID field is interpolated as a SQL identifier below. Reject anything that is
+            // not an allow-listed Identity column instead of executing an attacker-controlled identifier.
+            if (!validColumns.Contains(uniqueIdField))
+            {
+                result.ErrorMessage = $"Unique ID field '{uniqueIdField}' is not a recognized Identity column and was rejected.";
+                result.Errors = records.Count;
+                return result;
+            }
+
             for (int rowIdx = 0; rowIdx < records.Count; rowIdx++)
             {
                 var record = records[rowIdx];
@@ -325,7 +334,7 @@ public class HRImportRepository : DapperRepositoryBase, IHRImportRepository
 
                         if (updatableColumns.Count > 0)
                         {
-                            var selectCols = string.Join(", ", updatableColumns.Select(c => $"[{c.Key}]"));
+                            var selectCols = string.Join(", ", updatableColumns.Select(c => $"[{ValidateIdentityColumn(c.Key, validColumns)}]"));
                             var currentValues = await conn.QueryFirstOrDefaultAsync(
                                 $"SELECT {selectCols} FROM Identities WHERE Id = @Id",
                                 new { Id = existingId.Value });
@@ -356,7 +365,7 @@ public class HRImportRepository : DapperRepositoryBase, IHRImportRepository
                             if (col.Key.Equals(uniqueIdField, StringComparison.OrdinalIgnoreCase))
                                 continue; // Don't update the key field
 
-                            setClauses.Add($"[{col.Key}] = @{col.Key}");
+                            setClauses.Add($"[{ValidateIdentityColumn(col.Key, validColumns)}] = @{col.Key}");
                             parameters.Add(col.Key, col.Value);
                         }
 
@@ -466,7 +475,7 @@ public class HRImportRepository : DapperRepositoryBase, IHRImportRepository
                             result.Enabled++;
                         }
 
-                        var colNames = columns.Keys.Select(k => $"[{k}]");
+                        var colNames = columns.Keys.Select(k => $"[{ValidateIdentityColumn(k, validColumns)}]");
                         var paramNames = columns.Keys.Select(k => $"@{k}");
                         var insertSql = $"INSERT INTO Identities ({string.Join(", ", colNames)}) VALUES ({string.Join(", ", paramNames)})";
 
@@ -587,5 +596,22 @@ public class HRImportRepository : DapperRepositoryBase, IHRImportRepository
         }
 
         return fieldName; // Return original if no match found
+    }
+
+    // System-managed columns the importer writes directly (never sourced from a mapping/config value).
+    private static readonly HashSet<string> _identitySystemColumns = new(StringComparer.OrdinalIgnoreCase)
+        { "Id", "CreatedAt", "ModifiedAt", "IsActive", "Status" };
+
+    /// <summary>
+    /// Validates a column name before it is interpolated into a SQL identifier position.
+    /// Only allow-listed Identity columns (the writable set plus system-managed columns) are permitted;
+    /// anything else is rejected to prevent SQL injection via admin-authored field mappings.
+    /// </summary>
+    private static string ValidateIdentityColumn(string column, HashSet<string> validColumns)
+    {
+        if (!validColumns.Contains(column) && !_identitySystemColumns.Contains(column))
+            throw new InvalidOperationException(
+                $"HR Import rejected target column '{column}' — not an allow-listed Identity column.");
+        return column;
     }
 }

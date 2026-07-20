@@ -4,6 +4,7 @@ using Dapper;
 using DataAccessLibrary.Models;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using ChangeHistory.Services;
 using ChangeRecord = ChangeHistory.Models.ChangeRecord;
 using ChangeOpType = ChangeHistory.Models.ChangeOperationType;
@@ -728,30 +729,35 @@ public class InternalSyncStepExecutor : IInternalSyncStepExecutor
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // Admin-authored mappings control these identifiers; validate before concatenating
+                // them into SQL identifier positions. Rejection throws and is caught by the step handler.
+                var targetColumn = ValidateObjectColumn(mapping.TargetField);
+                var sourceColumn = ValidateObjectColumn(mapping.SourceField);
+
                 // Build the SET and WHERE clause depending on overwrite mode
                 string setClause;
                 string changeFilter;
                 if (mapping.OverwriteExisting)
                 {
-                    setClause = string.Concat("i.", mapping.TargetField, " = o.", mapping.SourceField);
+                    setClause = string.Concat("i.[", targetColumn, "] = o.[", sourceColumn, "]");
                     // Update rows where source differs from target (including NULL → clear the field)
                     changeFilter = string.Concat(
-                        "AND (i.", mapping.TargetField, " IS NULL AND o.", mapping.SourceField, " IS NOT NULL ",
-                        "OR i.", mapping.TargetField, " IS NOT NULL AND o.", mapping.SourceField, " IS NULL ",
-                        "OR i.", mapping.TargetField, " != o.", mapping.SourceField, ")");
+                        "AND (i.[", targetColumn, "] IS NULL AND o.[", sourceColumn, "] IS NOT NULL ",
+                        "OR i.[", targetColumn, "] IS NOT NULL AND o.[", sourceColumn, "] IS NULL ",
+                        "OR i.[", targetColumn, "] != o.[", sourceColumn, "])");
                 }
                 else
                 {
-                    setClause = string.Concat("i.", mapping.TargetField, " = COALESCE(i.", mapping.TargetField, ", o.", mapping.SourceField, ")");
+                    setClause = string.Concat("i.[", targetColumn, "] = COALESCE(i.[", targetColumn, "], o.[", sourceColumn, "])");
                     // Only update rows where target is null and source has a value
-                    changeFilter = string.Concat("AND i.", mapping.TargetField, " IS NULL AND o.", mapping.SourceField, " IS NOT NULL");
+                    changeFilter = string.Concat("AND i.[", targetColumn, "] IS NULL AND o.[", sourceColumn, "] IS NOT NULL");
                 }
 
                 var perFieldSql = string.Concat(
                     "UPDATE i SET ", setClause, ", i.ModifiedAt = GETUTCDATE() ",
                     "OUTPUT INSERTED.Id, INSERTED.DisplayName, ",
-                    "DELETED.", mapping.TargetField, " AS OldValue, ",
-                    "INSERTED.", mapping.TargetField, " AS NewValue ",
+                    "DELETED.[", targetColumn, "] AS OldValue, ",
+                    "INSERTED.[", targetColumn, "] AS NewValue ",
                     "FROM Identities i ",
                     "INNER JOIN Objects o ON o.IdentityId = i.Id ",
                     "WHERE o.IdentityId IS NOT NULL ",
@@ -1554,17 +1560,18 @@ public class InternalSyncStepExecutor : IInternalSyncStepExecutor
                     if (sourceValue != null || mapping.DefaultValue != null)
                     {
                         var value = sourceValue ?? mapping.DefaultValue;
+                        var targetColumn = ValidateObjectColumn(mapping.TargetField);
 
                         if (mapping.OverwriteExisting)
                         {
-                            updates.Add($"{mapping.TargetField} = @{mapping.TargetField}");
+                            updates.Add($"[{targetColumn}] = @{targetColumn}");
                         }
                         else
                         {
-                            updates.Add($"{mapping.TargetField} = COALESCE({mapping.TargetField}, @{mapping.TargetField})");
+                            updates.Add($"[{targetColumn}] = COALESCE([{targetColumn}], @{targetColumn})");
                         }
 
-                        parameters.Add(mapping.TargetField, value);
+                        parameters.Add(targetColumn, value);
                     }
                 }
 
@@ -1907,6 +1914,21 @@ public class InternalSyncStepExecutor : IInternalSyncStepExecutor
         {
             return null;
         }
+    }
+
+    private static readonly Regex _safeColumnRegex = new(@"^[A-Za-z0-9_]+$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Validates a mapping target column before it is interpolated into a SQL identifier position.
+    /// Admin-authored mappings control this value, so anything outside a strict identifier allow-list
+    /// is rejected rather than executed.
+    /// </summary>
+    private static string ValidateObjectColumn(string column)
+    {
+        if (string.IsNullOrWhiteSpace(column) || !_safeColumnRegex.IsMatch(column))
+            throw new InvalidOperationException(
+                $"Field sync rejected target column '{column}' — not a valid SQL identifier.");
+        return column;
     }
 
     #endregion
