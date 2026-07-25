@@ -43,13 +43,23 @@ public interface IAgentCommandRepository
     /// <summary>
     /// Completes a command claimed via <see cref="ClaimAsync"/>. Guarded:
     /// only the claiming agent, only from Acked. False = no transition (uniform 404).
+    /// The affected-row count IS the idempotency guard: a duplicate delivery transitions 0 rows.
+    /// <paramref name="resultJson"/> (V167) is optional structured, UNTRUSTED agent output.
     /// </summary>
-    Task<bool> CompleteClaimedAsync(Guid id, Guid agentId, bool success, string? message);
+    Task<bool> CompleteClaimedAsync(Guid id, Guid agentId, bool success, string? message, string? resultJson = null);
 
     /// <summary>
     /// Legacy complete: UNTARGETED rows only, only from Acked. False = no transition.
     /// </summary>
-    Task<bool> CompleteAsync(Guid id, bool success, string? message);
+    Task<bool> CompleteAsync(Guid id, bool success, string? message, string? resultJson = null);
+
+    /// <summary>
+    /// Atomically cancels a command ONLY if it is still Pending (Pending -> Cancelled). A claimed /
+    /// in-flight command is NEVER cancelled — the agent may be mid-create. True only when this call
+    /// performed the transition; the affected-row count is the safety guard against the timeout-race
+    /// orphan (failure #2).
+    /// </summary>
+    Task<bool> CancelIfPendingAsync(Guid id);
 
     /// <summary>True when any command has ever been acked — cheap "an agent has connected" signal.</summary>
     Task<bool> AnyAckedAsync();

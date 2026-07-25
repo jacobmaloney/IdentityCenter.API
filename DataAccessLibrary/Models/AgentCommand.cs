@@ -18,6 +18,10 @@ public class AgentCommand
     public bool? Success { get; set; }
     public string? ResultMessage { get; set; }
 
+    /// <summary>Structured agent result (V167). Carries objectGUID / DN / verbatim ldapError that
+    /// the NVARCHAR(2000) ResultMessage cannot. Untrusted agent input.</summary>
+    public string? ResultJson { get; set; }
+
     /// <summary>Registered agent this command is addressed to. NULL = legacy untargeted broadcast.</summary>
     public Guid? TargetAgentId { get; set; }
 

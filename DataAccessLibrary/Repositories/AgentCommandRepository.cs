@@ -12,9 +12,11 @@ namespace DataAccessLibrary.Repositories;
 public class AgentCommandRepository : DapperRepositoryBase, IAgentCommandRepository
 {
     private const int MaxPayloadBytes = 64 * 1024;
+    // ResultJson (untrusted agent output) gets the same 64KB bound as the inbound payload.
+    private const int MaxResultJsonBytes = 64 * 1024;
 
     private const string SelectColumns =
-        "Id, CommandType, PayloadJson, Status, RequestedBy, RequestedAt, AckedAt, CompletedAt, Success, ResultMessage, " +
+        "Id, CommandType, PayloadJson, Status, RequestedBy, RequestedAt, AckedAt, CompletedAt, Success, ResultMessage, ResultJson, " +
         "TargetAgentId, ClaimedByAgentId, AttemptCount";
 
     public AgentCommandRepository(IConfiguration configuration, IGlobalLogger logger)
@@ -101,35 +103,62 @@ public class AgentCommandRepository : DapperRepositoryBase, IAgentCommandReposit
             return updated > 0;
         });
 
-    public Task<bool> CompleteClaimedAsync(Guid id, Guid agentId, bool success, string? message)
+    public Task<bool> CompleteClaimedAsync(Guid id, Guid agentId, bool success, string? message, string? resultJson = null)
         => ExecuteAsync(async conn =>
         {
             var truncated = message is { Length: > 2000 } ? message[..2000] : message;
+            var boundedResult = BoundResultJson(resultJson);
             var updated = await conn.ExecuteAsync(@"
                 UPDATE AgentCommands
                 SET Status = @Status,
                     CompletedAt = SYSUTCDATETIME(),
                     Success = @Success,
-                    ResultMessage = @Message
+                    ResultMessage = @Message,
+                    ResultJson = @ResultJson
                 WHERE Id = @Id AND ClaimedByAgentId = @AgentId AND Status = 'Acked';",
-                new { Id = id, AgentId = agentId, Status = success ? "Completed" : "Failed", Success = success, Message = truncated });
+                new { Id = id, AgentId = agentId, Status = success ? "Completed" : "Failed", Success = success, Message = truncated, ResultJson = boundedResult });
             return updated > 0;
         });
 
-    public Task<bool> CompleteAsync(Guid id, bool success, string? message)
+    public Task<bool> CompleteAsync(Guid id, bool success, string? message, string? resultJson = null)
         => ExecuteAsync(async conn =>
         {
             var truncated = message is { Length: > 2000 } ? message[..2000] : message;
+            var boundedResult = BoundResultJson(resultJson);
             var updated = await conn.ExecuteAsync(@"
                 UPDATE AgentCommands
                 SET Status = @Status,
                     CompletedAt = SYSUTCDATETIME(),
                     Success = @Success,
-                    ResultMessage = @Message
+                    ResultMessage = @Message,
+                    ResultJson = @ResultJson
                 WHERE Id = @Id AND TargetAgentId IS NULL AND Status = 'Acked';",
-                new { Id = id, Status = success ? "Completed" : "Failed", Success = success, Message = truncated });
+                new { Id = id, Status = success ? "Completed" : "Failed", Success = success, Message = truncated, ResultJson = boundedResult });
             return updated > 0;
         });
+
+    public Task<bool> CancelIfPendingAsync(Guid id)
+        => ExecuteAsync(async conn =>
+        {
+            // ONLY from Pending — a Claimed/Acked/in-flight command is never cancelled (the agent may
+            // be mid-create). The affected-row count is the timeout-race guard (failure #2).
+            var updated = await conn.ExecuteAsync(@"
+                UPDATE AgentCommands
+                SET Status = 'Cancelled', CompletedAt = SYSUTCDATETIME()
+                WHERE Id = @Id AND Status = 'Pending';",
+                new { Id = id });
+            return updated > 0;
+        });
+
+    // Reject an oversized result rather than truncate structured JSON into an unparseable fragment.
+    private static string? BoundResultJson(string? resultJson)
+    {
+        if (resultJson is null)
+            return null;
+        if (System.Text.Encoding.UTF8.GetByteCount(resultJson) > MaxResultJsonBytes)
+            throw new ArgumentException($"ResultJson exceeds the {MaxResultJsonBytes / 1024}KB limit.", nameof(resultJson));
+        return resultJson;
+    }
 
     public Task<bool> AnyAckedAsync()
         => ExecuteAsync(async conn =>

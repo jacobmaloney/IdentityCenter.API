@@ -144,14 +144,20 @@ public class AgentCommandsController : ControllerBase
         if (request is null)
             return BadRequest(new { error = "Body { success, message } is required" });
 
+        // Reject (not truncate) an oversize structured result at the boundary, so it surfaces as a 400
+        // rather than an unhandled 500 from the repository's hard cap.
+        if (request.ResultJson is not null &&
+            System.Text.Encoding.UTF8.GetByteCount(request.ResultJson) > 64 * 1024)
+            return BadRequest(new { error = "resultJson exceeds the 64KB limit." });
+
         var agentId = AgentId;
         // A key CARRYING an agent_id claim that fails to parse must not slide
         // into the legacy untargeted path.
         if (agentId is null && User.FindFirst("agent_id") is not null)
             return StatusCode(StatusCodes.Status403Forbidden, new { error = "agent_id claim is malformed" });
         var transitioned = agentId is not null
-            ? await _commands.CompleteClaimedAsync(id, agentId.Value, request.Success, request.Message)
-            : await _commands.CompleteAsync(id, request.Success, request.Message);
+            ? await _commands.CompleteClaimedAsync(id, agentId.Value, request.Success, request.Message, request.ResultJson)
+            : await _commands.CompleteAsync(id, request.Success, request.Message, request.ResultJson);
         if (!transitioned)
             return NotFound(new { error = "Unknown command id" });
 

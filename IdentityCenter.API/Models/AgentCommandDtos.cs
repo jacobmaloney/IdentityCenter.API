@@ -8,6 +8,13 @@ public class AgentCommandCompleteRequest
 {
     public bool Success { get; set; }
     public string? Message { get; set; }
+
+    /// <summary>
+    /// Optional structured result (V167) — e.g. a CreateAdAccount's objectGUID / DN / verbatim
+    /// ldapError. Untrusted agent input; persisted bounded and validated before use. An older agent
+    /// omits it and the completion is handled as before.
+    /// </summary>
+    public string? ResultJson { get; set; }
 }
 
 /// <summary>
