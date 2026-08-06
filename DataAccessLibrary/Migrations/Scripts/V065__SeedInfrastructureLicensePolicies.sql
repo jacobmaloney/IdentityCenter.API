@@ -148,7 +148,7 @@ INSERT INTO CompliancePolicies (
 VALUES (
     'C0650000-0000-0000-0000-000000000004',
     N'SQL Enterprise License Audit', N'Quarterly SQL Enterprise License Review',
-    N'Identifies all SQL Server Enterprise Edition instances for quarterly license compliance review. Enterprise Edition is the highest-cost SQL SKU ($15,123/core/year) — regular audits ensure accurate CAL allocation.',
+    N'Identifies all SQL Server Enterprise Edition instances for quarterly license compliance review. Enterprise Edition is the highest-cost SQL SKU (~$7,561.50/core/year, i.e. the $15,123 2-core pack) — regular audits ensure accurate CAL allocation.',
     N'InfrastructureLicense', 3, 4,
     0, 1, 2160,
     0, 0, 0, 0, 0,

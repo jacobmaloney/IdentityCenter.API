@@ -18,10 +18,6 @@ public class LicensePoolGeneratorService : ILicensePoolGeneratorService
     private static readonly Guid SqlServerCategoryId = new("C0710000-0000-0000-0000-000000000003");
     private static readonly Guid DevTestCategoryId = new("C0710000-0000-0000-0000-000000000005");
 
-    // Realistic per-core annual pricing (monthly stored = annual / 12)
-    private const decimal SqlEnterpriseCostPerCoreAnnual = 15123m;
-    private const decimal SqlStandardCostPerCoreAnnual = 3945m;
-
     public LicensePoolGeneratorService(IConfiguration configuration, IGlobalLogger logger)
     {
         _connectionString = configuration.GetConnectionString("DefaultConnection")
@@ -57,6 +53,9 @@ public class LicensePoolGeneratorService : ILicensePoolGeneratorService
                 return 0;
             }
 
+            // Per-core pricing from Settings(SqlLicense/*) — single source of truth.
+            var costs = await SqlLicenseCostSettings.LoadAsync(conn);
+
             foreach (var row in discovery)
             {
                 if (ct.IsCancellationRequested) break;
@@ -64,7 +63,7 @@ public class LicensePoolGeneratorService : ILicensePoolGeneratorService
                 // Enterprise & Standard get per-core + instance pools
                 if (row.Edition == "Enterprise" || row.Edition == "Standard")
                 {
-                    created += await UpsertCorePoolAsync(conn, connectionId, row.Edition, row.TotalCores, row.ServerCount);
+                    created += await UpsertCorePoolAsync(conn, connectionId, row.Edition, row.TotalCores, row.ServerCount, costs);
                     created += await UpsertInstancePoolAsync(conn, connectionId, row.Edition, row.ServerCount, 0m, SqlServerCategoryId);
                 }
                 else if (row.Edition == "Express")
@@ -88,10 +87,10 @@ public class LicensePoolGeneratorService : ILicensePoolGeneratorService
         return created;
     }
 
-    private async Task<int> UpsertCorePoolAsync(SqlConnection conn, Guid connectionId, string edition, int totalCores, int serverCount)
+    private async Task<int> UpsertCorePoolAsync(SqlConnection conn, Guid connectionId, string edition, int totalCores, int serverCount, SqlLicenseCostSettings.CostSet costs)
     {
         var skuId = $"SQL-{edition.ToUpper()[..3]}-CORE-{connectionId}";
-        var costPerCoreAnnual = edition == "Enterprise" ? SqlEnterpriseCostPerCoreAnnual : SqlStandardCostPerCoreAnnual;
+        var costPerCoreAnnual = costs.PerCoreAnnualFor(edition);
 
         var affected = await conn.ExecuteAsync(@"
             MERGE LicensePools AS tgt
